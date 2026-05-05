@@ -11,6 +11,15 @@ The art is intentionally simple but has correctly-placed lapels, a V-neck
 shirt, and a centered collar so the alignment math has meaningful fiducials
 to lock onto.  Replace these PNGs with real photographic assets to reach
 production quality without changing any code.
+
+NOTE
+----
+The shipped ``templates/default_suit`` now points at a real photographic
+asset (``21.png``) via the ``body_image`` key in ``config.json``.  Running
+this script will *recreate* the procedural ``body.png`` / ``collar.png``
+files but **will not** overwrite the ``config.json`` if it already
+references a different body image — see the ``build_template`` function
+for the exact behaviour.
 """
 from __future__ import annotations
 
@@ -185,9 +194,32 @@ def build_template(out_dir: str) -> None:
     collar = build_collar()
     cv2.imwrite(os.path.join(out_dir, "body.png"), body)
     cv2.imwrite(os.path.join(out_dir, "collar.png"), collar)
+
+    cfg_path = os.path.join(out_dir, "config.json")
+    # Preserve a hand-edited config that points at a different garment
+    # image (e.g. 21.png) — we don't want this build script to silently
+    # overwrite the production anchors and revert the template back to
+    # the procedural fall-back asset.
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+        body_image = (existing.get("body_image") or "body.png").lower()
+        if body_image != "body.png":
+            print(
+                f"Preserving existing config.json at {cfg_path}: "
+                f"body_image='{existing.get('body_image')}' is not the procedural body.png."
+            )
+            print(f"Wrote procedural body.png/collar.png to {out_dir}")
+            return
+
     config = {
         "name": "default_suit",
         "description": "Procedurally-generated charcoal suit with white shirt and tie.",
+        "body_image": "body.png",
+        "collar_image": "collar.png",
         "anchor_points": {
             "left_shoulder": list(ANCHOR_LEFT_SHOULDER),
             "right_shoulder": list(ANCHOR_RIGHT_SHOULDER),
@@ -206,7 +238,7 @@ def build_template(out_dir: str) -> None:
             "final_sharpen": 0.15,
         },
     }
-    with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
+    with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     print(f"Wrote template to {out_dir}")
 

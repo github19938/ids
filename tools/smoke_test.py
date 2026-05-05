@@ -106,10 +106,15 @@ def run_deterministic() -> int:
     t0 = time.perf_counter()
     align = compute_transform(kp, template, scale_bias=1.05, y_offset_ratio=0.02)
     body_warp = warp_rgba(template.body, align.matrix, (h, w))
-    collar_warp = warp_rgba(template.collar, align.matrix, (h, w))
+    collar_warp = (
+        warp_rgba(template.collar, align.matrix, (h, w))
+        if template.collar is not None
+        else None
+    )
 
     body_warp = match_color(body_warp, portrait, masks.neck, ColorMatchConfig(strength=0.4))
-    collar_warp = match_color(collar_warp, portrait, masks.neck, ColorMatchConfig(strength=0.2))
+    if collar_warp is not None:
+        collar_warp = match_color(collar_warp, portrait, masks.neck, ColorMatchConfig(strength=0.2))
 
     out = layered_render(portrait, masks, body_warp, collar_warp, RenderConfig())
     dt = (time.perf_counter() - t0) * 1000.0

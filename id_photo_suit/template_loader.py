@@ -3,7 +3,7 @@
 Template directory layout
 -------------------------
     <template_root>/
-        body.png        # required, RGBA
+        body.png        # required, RGBA  (filename overridable via config.json)
         collar.png      # optional, RGBA  (may be merged into body.png)
         config.json     # required
 
@@ -11,6 +11,8 @@ Template directory layout
 
     {
       "name": "default_suit",
+      "body_image":   "21.png",     # optional override of body image filename
+      "collar_image": "collar.png", # optional override; null/absent disables it
       "anchor_points": {
         "left_shoulder":  [x, y],
         "right_shoulder": [x, y],
@@ -26,6 +28,13 @@ Template directory layout
         "y_offset_ratio": 0.0
       }
     }
+
+The two image filename keys (``body_image`` and ``collar_image``) are
+optional.  When absent, the loader falls back to the historical
+``body.png`` / ``collar.png`` filenames, so existing templates continue
+to work unchanged.  Setting ``collar_image`` to ``null`` (or to an empty
+string) explicitly disables the collar layer — useful when the body PNG
+already contains the collar / tie / accessories baked in.
 
 Public API
 ----------
@@ -67,18 +76,31 @@ def load_template(path: str) -> GarmentTemplate:
         raise TemplateError(f"Template path is not a directory: {path}")
 
     cfg_path = os.path.join(path, "config.json")
-    body_path = os.path.join(path, "body.png")
-    collar_path = os.path.join(path, "collar.png")
-
     if not os.path.isfile(cfg_path):
         raise TemplateError(f"Missing config.json in {path}")
-    if not os.path.isfile(body_path):
-        raise TemplateError(f"Missing body.png in {path}")
 
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
     name = cfg.get("name") or os.path.basename(os.path.normpath(path))
+
+    # Resolve the body / collar image filenames.  config.json may override
+    # the historical defaults; when absent we fall back to body.png /
+    # collar.png so existing templates keep working unchanged.
+    body_filename = cfg.get("body_image") or "body.png"
+    collar_filename = cfg.get("collar_image", "collar.png")
+
+    body_path = os.path.join(path, body_filename)
+    if not os.path.isfile(body_path):
+        raise TemplateError(
+            f"Missing body image '{body_filename}' in {path} "
+            f"(set 'body_image' in config.json or place a body.png next to it)"
+        )
+
+    collar_path = (
+        os.path.join(path, collar_filename) if collar_filename else None
+    )
+
     anchors_raw = cfg.get("anchor_points") or {}
     for key in REQUIRED_ANCHORS:
         if key not in anchors_raw:
@@ -88,12 +110,16 @@ def load_template(path: str) -> GarmentTemplate:
     anchors = {k: (float(v[0]), float(v[1])) for k, v in anchors_raw.items()}
 
     body = _read_rgba(body_path)
-    collar = _read_rgba(collar_path) if os.path.isfile(collar_path) else None
+    collar = (
+        _read_rgba(collar_path)
+        if collar_path and os.path.isfile(collar_path)
+        else None
+    )
 
     if body.shape[2] != 4:
-        raise TemplateError("body.png must be RGBA (4 channels).")
+        raise TemplateError(f"{body_filename} must be RGBA (4 channels).")
     if collar is not None and collar.shape[2] != 4:
-        raise TemplateError("collar.png must be RGBA (4 channels).")
+        raise TemplateError(f"{collar_filename} must be RGBA (4 channels).")
 
     # Sanity: anchors should fall inside the body image.
     h, w = body.shape[:2]
