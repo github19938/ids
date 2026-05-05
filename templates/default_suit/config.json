@@ -1,0 +1,30 @@
+{
+  "name": "default_suit",
+  "description": "Procedurally-generated charcoal suit with white shirt and tie.",
+  "anchor_points": {
+    "left_shoulder": [
+      260,
+      360
+    ],
+    "right_shoulder": [
+      764,
+      360
+    ],
+    "neck": [
+      512,
+      320
+    ]
+  },
+  "color_match": {
+    "enable": true,
+    "strength": 0.35,
+    "match_chroma": false
+  },
+  "render": {
+    "feather_px": 6,
+    "protect_dilate_px": 2,
+    "scale_bias": 1.05,
+    "y_offset_ratio": 0.02,
+    "final_sharpen": 0.15
+  }
+}
