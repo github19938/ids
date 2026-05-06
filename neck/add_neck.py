@@ -704,19 +704,33 @@ def apply_film_grain_to_neck_bgra(
     sf = float(np.clip(sharp_factor, SHARP_FACTOR_MIN, SHARP_FACTOR_MAX))
     sigma = float(np.clip(face_grain_std * gain * sf, GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX))
     h, w = neck_bgra.shape[:2]
+    out = neck_bgra.copy()
+
+    # ROI：基于 alpha>8 的 bbox（脖子所在区域），只在该 ROI 内生成 noise，避免大图浪费
+    a_mask = neck_bgra[:, :, 3].astype(np.float32) > 8.0
+    if not np.any(a_mask):
+        return out
+    ys, xs = np.where(a_mask)
+    bx0 = max(0, int(xs.min()) - 4)
+    by0 = max(0, int(ys.min()) - 4)
+    bx1 = min(w, int(xs.max()) + 5)
+    by1 = min(h, int(ys.max()) + 5)
+    rh = by1 - by0
+    rw = bx1 - bx0
+
     if use_pink_noise:
         seed_val = seed if seed is not None else 0
         noise = np.stack([
-            generate_pink_noise_2d(h, w, sigma, seed=seed_val + i * 7919)
+            generate_pink_noise_2d(rh, rw, sigma, seed=seed_val + i * 7919)
             for i in range(3)
         ], axis=-1)
     else:
-        noise = np.zeros((h, w, 3), dtype=np.float32)
+        noise = np.zeros((rh, rw, 3), dtype=np.float32)
         cv2.randn(noise, (0.0, 0.0, 0.0), (sigma, sigma, sigma))
-    m = (neck_bgra[:, :, 3].astype(np.float32) > 8.0)[:, :, np.newaxis]
-    rgb = neck_bgra[:, :, :3].astype(np.float32) + noise * m
-    out = neck_bgra.copy()
-    out[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+    roi = neck_bgra[by0:by1, bx0:bx1]
+    m = (roi[:, :, 3].astype(np.float32) > 8.0)[:, :, np.newaxis]
+    rgb = roi[:, :, :3].astype(np.float32) + noise * m
+    out[by0:by1, bx0:bx1, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
     return out
 
 
@@ -1053,6 +1067,20 @@ def distance_map_to_polyline(h: int, w: int, pts: np.ndarray) -> np.ndarray:
     return dt.astype(np.float64)
 
 
+NECK_SHADE_ROI_PADDING_PX = 12
+
+
+def _bbox_poly_padded(
+    poly: np.ndarray, h: int, w: int, pad: int
+) -> Tuple[int, int, int, int]:
+    """多边形 bbox + 像素 padding，并裁切到图像范围内。返回 (x0, y0, x1, y1)（半开区间）。"""
+    x0 = max(0, int(np.floor(np.min(poly[:, 0]))) - int(pad))
+    y0 = max(0, int(np.floor(np.min(poly[:, 1]))) - int(pad))
+    x1 = min(w, int(np.ceil(np.max(poly[:, 0]))) + int(pad) + 1)
+    y1 = min(h, int(np.ceil(np.max(poly[:, 1]))) + int(pad) + 1)
+    return x0, y0, x1, y1
+
+
 def neck_cylinder_shade_map(
     h: int,
     w: int,
@@ -1067,6 +1095,7 @@ def neck_cylinder_shade_map(
     light_sign: float = -1.0,
     sss_alpha: float = NECK_CYLINDER_SSS_ALPHA,
     roll: float = 0.0,
+    roi_pad_px: int = NECK_SHADE_ROI_PADDING_PX,
 ) -> np.ndarray:
     """
     在整幅图上生成圆柱侧面亮度乘子 (h, w)。
@@ -1087,11 +1116,23 @@ def neck_cylinder_shade_map(
     k_ao = float(NECK_CYLINDER_AO_TOP if ao_top is None else ao_top)
     sign = float(np.sign(light_sign)) if abs(light_sign) > 1e-3 else -1.0
     sss_a = float(np.clip(sss_alpha, 0.0, 1.0))
-    xx = np.arange(w, dtype=np.float64)[np.newaxis, :]
-    yy_g = np.arange(h, dtype=np.float64)[:, np.newaxis]
-    x_axis = float(np.mean(poly[:, 0])) + float(x_axis_shift)
-    y_center = float(np.mean(poly[:, 1]))
-    span = float(np.max(poly[:, 0]) - np.min(poly[:, 0]))
+
+    # ROI：只在 polygon bbox + padding 内做 meshgrid / distanceTransform，省去整图大数组运算。
+    bx0, by0, bx1, by1 = _bbox_poly_padded(poly, h, w, roi_pad_px)
+    rh = by1 - by0
+    rw = bx1 - bx0
+    if rh < 4 or rw < 4:
+        return np.ones((h, w), dtype=np.float64)
+    poly_l = poly.copy()
+    poly_l[:, 0] -= float(bx0)
+    poly_l[:, 1] -= float(by0)
+    mask_l = mask[by0:by1, bx0:bx1]
+
+    xx = np.arange(rw, dtype=np.float64)[np.newaxis, :]
+    yy_g = np.arange(rh, dtype=np.float64)[:, np.newaxis]
+    x_axis = float(np.mean(poly_l[:, 0])) + float(x_axis_shift)
+    y_center = float(np.mean(poly_l[:, 1]))
+    span = float(np.max(poly_l[:, 0]) - np.min(poly_l[:, 0]))
     R = max(span * 0.5, 4.0)
     # roll 把圆柱整体绕 (x_axis, y_center) 倾斜：径向 / 高光的「水平」方向变成 (cos, sin) 矢量。
     cos_r = float(np.cos(roll))
@@ -1105,8 +1146,8 @@ def neck_cylinder_shade_map(
     # 朝光面 SSS 软化（sqrt-like 让光绕过曲面更多）；背光面保线性
     lit = (1.0 - sss_a) * lit_lin + sss_a * np.sqrt(np.maximum(lit_lin, 0.0))
     L = 1.0 + kL * lit - kS * sh_lin
-    y_min = float(np.min(poly[:, 1]))
-    y_max = float(np.max(poly[:, 1]))
+    y_min = float(np.min(poly_l[:, 1]))
+    y_max = float(np.max(poly_l[:, 1]))
     depth = max(y_max - y_min, 1.0)
 
     # 双层高光：窄 specular + 宽 diffuse roll-off；中心位置在「旋转后径向 = 偏移量 / R」处
@@ -1124,9 +1165,9 @@ def neck_cylinder_shade_map(
     shine = shine_n + shine_w
     L = L * (1.0 + shine)
 
-    n_up = max(poly.shape[0] // 2, 2)
-    upper = poly[:n_up].astype(np.float64)
-    dt = distance_map_to_polyline(h, w, upper)
+    n_up = max(poly_l.shape[0] // 2, 2)
+    upper = poly_l[:n_up].astype(np.float64)
+    dt = distance_map_to_polyline(rh, rw, upper)
     tau = max(depth * float(NECK_AO_DT_TAU_FRAC), float(NECK_AO_DT_TAU_MIN_PX))
     ao_w = np.exp(-dt / tau)
     L = L * (1.0 - k_ao * np.power(ao_w, 0.95))
@@ -1152,13 +1193,16 @@ def neck_cylinder_shade_map(
     g_c = np.exp(-0.5 * np.square(x_perp / sig_ridge))
     L = L * (1.0 + float(NECK_ANATOMY_RIDGE_BRIGHT) * g_c * vert_win)
 
-    wm = mask > 0
-    if np.any(wm):
-        mu = float(np.mean(L[wm]))
+    wm_l = mask_l > 0
+    if np.any(wm_l):
+        mu = float(np.mean(L[wm_l]))
         L = L / max(mu, 1e-6)
     L = np.clip(L, float(NECK_CYLINDER_L_MIN), float(NECK_CYLINDER_L_MAX))
-    wm_f = wm.astype(np.float64)
-    return L * wm_f + (1.0 - wm_f)
+    wm_f = wm_l.astype(np.float64)
+    L_local = L * wm_f + (1.0 - wm_f)
+    L_full = np.ones((h, w), dtype=np.float64)
+    L_full[by0:by1, bx0:bx1] = L_local
+    return L_full
 
 
 def alpha_over(bottom: np.ndarray, top: np.ndarray) -> np.ndarray:
