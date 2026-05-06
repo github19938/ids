@@ -179,10 +179,20 @@ Per-template overrides in `config.json`:
 
 ```json
 {
+  "body_image":   "21.png",
+  "collar_image": null,
   "render":      { "feather_px": 6, "scale_bias": 1.05, "y_offset_ratio": 0.02 },
   "color_match": { "enable": true, "strength": 0.35, "match_chroma": false }
 }
 ```
+
+`body_image` (optional, defaults to `body.png`) selects which RGBA file
+inside the template directory is used as the garment body.  Set
+`collar_image` to `null` (or simply omit it) when the body image already
+contains the collar / tie / accessories baked in — the renderer will
+then skip the separate collar layer entirely.  The historical
+`body.png` / `collar.png` filenames continue to work without any change
+to existing templates.
 
 Programmatic:
 
