@@ -88,13 +88,31 @@ NECK_CYLINDER_AO_TOP = 0.028
 # 距离变换衰减长度（相对脖子深度 depth 的比例，下限像素）
 NECK_AO_DT_TAU_FRAC = 0.24
 NECK_AO_DT_TAU_MIN_PX = 6.0
-# 左右颊 V 通道差 → 圆柱轴 / 高光横向偏移（左亮则轴与高光略向左）
+# 多点估光（L/R 颊、额左右、下颌左右、额中、下巴上）→ 最小二乘拟合 2D V 梯度，
+# 比单一「左右颊 V 差」对侧光/平光/俯仰光更鲁棒，并能避免「默认主光偏左」的硬编码偏置。
+LIGHT_SAMPLE_LANDMARKS: List[Tuple[int, str, int]] = [
+    (205, "L-cheek", SKIN_PATCH_CHEEK_PX),
+    (425, "R-cheek", SKIN_PATCH_CHEEK_PX),
+    (103, "L-forehead", SKIN_PATCH_OTHER_PX),
+    (332, "R-forehead", SKIN_PATCH_OTHER_PX),
+    (172, "L-jaw", SKIN_PATCH_OTHER_PX),
+    (397, "R-jaw", SKIN_PATCH_OTHER_PX),
+    (10, "forehead-mid", SKIN_PATCH_OTHER_PX),
+    (200, "above-chin", SKIN_PATCH_OTHER_PX),
+]
+# V 梯度（lstsq 拟合 V = a + b*x_norm + c*y_norm，x/y 已用 R 归一化）→ 圆柱轴 / 高光横向偏移
 NECK_LIGHT_AXIS_GAIN = 0.88
 NECK_SHINE_TRACK_GAIN = 0.58
 NECK_SHINE_K = 0.042
-NECK_SHINE_SIGMA_FRAC = 0.19
-# 默认主光略偏左时的高光基线（相对轴再往左）
-NECK_SHINE_BASE_OFFSET_FRAC = 0.15
+# 双层高光：窄 specular 峰（高频反射）+ 宽漫射 roll-off（皮肤次表面散射使高光柔化）
+NECK_SHINE_SIGMA_FRAC = 0.10
+NECK_SHINE_DIFFUSE_SIGMA_FRAC = 0.45
+NECK_SHINE_NARROW_SHARE = 0.55  # 0~1：能量分配到窄峰的比例，剩下给宽 roll-off
+# 「默认主光偏左」的硬编码偏置已移除，spec 中心位置完全由数据驱动；
+# 仅保留一个 SAFETY 偏移：当数据里的 |gx| < 阈值（基本平光）时把 spec 略偏到 lit 侧
+NECK_SHINE_FLAT_LIGHT_FALLBACK_FRAC = 0.04
+# 圆柱朝光面 SSS 软化系数（0=纯线性，1=完全 sqrt）：模拟皮肤次表面散射使光「绕过」曲面
+NECK_CYLINDER_SSS_ALPHA = 0.40
 # 脸部 V 对比度 → 圆柱 K / 高光强度缩放（平光弱、强侧光强）
 NECK_LIGHT_STRENGTH_LR_COEF = 2.0
 NECK_LIGHT_STRENGTH_RNG_COEF = 1.05
@@ -232,7 +250,7 @@ def mean_hsv_v_in_patch(
 
 
 class FaceNeckLightParams(NamedTuple):
-    """由脸部局部 V 推断脖子光照：轴偏移、圆柱强度、高光、AO、肤色线性渐变系数。"""
+    """由脸部局部 V 推断脖子光照：轴偏移、圆柱强度、高光、AO、肤色线性渐变系数、光源方向。"""
 
     x_axis_shift: float
     spec_x_shift: float
@@ -242,6 +260,8 @@ class FaceNeckLightParams(NamedTuple):
     ao_top: float
     skin_grad_gx: float
     skin_grad_gy: float
+    # +1 表示主光从画面右侧来（lit 在右侧）；-1 表示从左侧；数据弱（平光）时回退 -1（与原硬编码兼容）。
+    light_sign: float = -1.0
 
 
 def estimate_face_lighting_for_neck(
@@ -252,35 +272,65 @@ def estimate_face_lighting_for_neck(
     R: float,
 ) -> FaceNeckLightParams:
     """
-    用与肤色采样一致的关键点小块 **HSV-V 均值** 估计照在脸上的光：
+    多点估光：在 ``LIGHT_SAMPLE_LANDMARKS`` 列出的左右颊 / 左右额 / 左右下颌 / 额中 / 下巴上
+    一共 8 个点采小块的 **HSV-V 均值**，对位置做 R 归一化后**最小二乘拟合 V = a + b*xn + c*yn**，
+    得到 2D 光梯度 ``(gx_norm, gy_norm)``：
 
-    - 左右颊(205/425) 推断 **横向** 来光（轴与高光带平移）；
-    - 额(10) 与下巴上(200) 推断 **上下** 分量，驱动脖子 albedo 的弱竖直渐变；
-    - ``|V_L-V_R|``、多块 V 的极差与标准差 → **对比度强度**，自适应缩放 ``K_LIT`` / ``K_SHADOW``、
-      高光强度（平光时减弱、强侧光或高反差时增强）；
-    - 双颊平均明显亮于下巴上区时略 **加强 AO**（颌下更贴重阴影照片）。
+    - ``gx_norm > 0``：右侧亮（光从右），``light_sign = +1``；反之 ``-1``；
+    - 圆柱轴 / 高光带 横向偏移：均与 ``gx_norm`` 同向（替代原"左右颊 V 差"单点近似）；
+    - 强度：用 8 点 V 的极差 + 标准差 + ``|gx_norm|`` 综合算 ``strength``；
+    - **取消** 原"默认主光偏左"硬偏置 ``NECK_SHINE_BASE_OFFSET_FRAC=0.15``；平光时 spec 居中，
+      仅当 ``|gx|`` 太小且 ``light_sign`` 仍 fallback 时给一点点 ``FLAT_LIGHT_FALLBACK`` 偏移；
+    - 上下分量 ``gy_norm`` 驱动脖子 albedo 的弱竖直渐变；
+    - 双颊平均明显亮于下巴上区时略加强 AO（颌下更贴重阴影照片）。
     """
     lm = landmarks.landmark
     Rf = float(max(R, 4.0))
 
-    def patch_v(lid: int, psize: int) -> Optional[float]:
+    samples: List[Tuple[int, float, float, float]] = []
+    for lid, _, psize in LIGHT_SAMPLE_LANDMARKS:
         cx, cy = landmark_xy(lm[lid], iw, ih)
         x0, y0, pw, ph = skin_patch_rect_at(cx, cy, ih, iw, psize)
-        return mean_hsv_v_in_patch(bgra, x0, y0, pw, ph)
+        v = mean_hsv_v_in_patch(bgra, x0, y0, pw, ph)
+        if v is not None:
+            samples.append((int(lid), float(cx), float(cy), float(v)))
+    by_lid = {s[0]: (s[1], s[2], s[3]) for s in samples}
 
-    vl = patch_v(205, SKIN_PATCH_CHEEK_PX)
-    vr = patch_v(425, SKIN_PATCH_CHEEK_PX)
-    vf = patch_v(10, SKIN_PATCH_OTHER_PX)
-    vu = patch_v(200, SKIN_PATCH_OTHER_PX)
+    if len(samples) >= 4:
+        xs = np.array([s[1] for s in samples], dtype=np.float64)
+        ys = np.array([s[2] for s in samples], dtype=np.float64)
+        vs = np.array([s[3] for s in samples], dtype=np.float64)
+        cx_face = float(np.mean(xs))
+        cy_face = float(np.mean(ys))
+        xn = (xs - cx_face) / Rf
+        yn = (ys - cy_face) / Rf
+        A = np.column_stack([np.ones_like(xn), xn, yn])
+        coef, *_ = np.linalg.lstsq(A, vs, rcond=None)
+        v_mean = float(np.mean(vs)) + 1e-3
+        gx_norm = float(np.clip(coef[1] / v_mean, -0.45, 0.45))
+        gy_norm = float(np.clip(coef[2] / v_mean, -0.45, 0.45))
+        v_std = float(np.std(vs))
+        v_rng = (float(np.max(vs)) - float(np.min(vs))) / 255.0
+    else:
+        # 数据太少，回退老路径（仅依赖左右颊 + 额/下巴上 V 差）
+        vl_t = by_lid.get(205, (None, None, None))[2]
+        vr_t = by_lid.get(425, (None, None, None))[2]
+        vf_t = by_lid.get(10, (None, None, None))[2]
+        vu_t = by_lid.get(200, (None, None, None))[2]
+        vals = [v for v in (vl_t, vr_t, vf_t, vu_t) if v is not None]
+        v_std = float(np.std(np.array(vals, dtype=np.float64))) if len(vals) >= 2 else 0.0
+        v_rng = (max(vals) - min(vals)) / 255.0 if len(vals) >= 2 else 0.0
+        if vl_t is not None and vr_t is not None:
+            denom = float(vl_t + vr_t) + 1e-3
+            gx_norm = float(np.clip((float(vr_t) - float(vl_t)) / denom, -0.28, 0.28))
+        else:
+            gx_norm = 0.0
+        if vf_t is not None and vu_t is not None:
+            gy_norm = float(np.clip((float(vu_t) - float(vf_t)) / 255.0, -0.22, 0.22))
+        else:
+            gy_norm = 0.0
 
-    vals = [float(v) for v in (vl, vr, vf, vu) if v is not None]
-    v_std = float(np.std(np.array(vals, dtype=np.float64))) if len(vals) >= 2 else 0.0
-    v_rng = (max(vals) - min(vals)) / 255.0 if len(vals) >= 2 else 0.0
-
-    lr_asym = 0.0
-    if vl is not None and vr is not None:
-        lr_asym = abs(float(vl) - float(vr)) / (float(vl) + float(vr) + 1e-3)
-
+    lr_asym = abs(gx_norm)
     strength = float(
         NECK_LIGHT_STRENGTH_MIN
         + float(NECK_LIGHT_STRENGTH_LR_COEF) * lr_asym
@@ -289,14 +339,16 @@ def estimate_face_lighting_for_neck(
     )
     strength = float(np.clip(strength, NECK_LIGHT_STRENGTH_MIN, NECK_LIGHT_STRENGTH_MAX))
 
-    if vl is None or vr is None:
-        axis_shift = 0.0
-        spec_shift = 0.0
+    # 主光方向：gx_norm > 0 表示右侧亮（光从右）→ light_sign = +1；反之 -1。
+    # 数据极弱（|gx| < 0.025）时 fallback 到 -1（保持与原硬编码"主光默认偏左"的视觉风格）。
+    if abs(gx_norm) >= 0.025:
+        light_sign = 1.0 if gx_norm > 0.0 else -1.0
     else:
-        denom = float(vl + vr) + 1e-3
-        dv = float(np.clip((float(vl) - float(vr)) / denom, -0.28, 0.28))
-        axis_shift = -float(NECK_LIGHT_AXIS_GAIN) * dv * Rf
-        spec_shift = -float(NECK_SHINE_TRACK_GAIN) * dv * Rf
+        light_sign = -1.0
+
+    # axis_shift / spec_shift 跟随 gx_norm 同向（光从右 gx_norm>0 → 偏移到右侧）
+    axis_shift = float(NECK_LIGHT_AXIS_GAIN) * gx_norm * Rf
+    spec_shift = float(NECK_SHINE_TRACK_GAIN) * gx_norm * Rf
 
     k_lit = float(NECK_CYLINDER_K_LIT) * strength
     k_shadow = float(NECK_CYLINDER_K_SHADOW) * strength
@@ -310,14 +362,17 @@ def estimate_face_lighting_for_neck(
     shine_k = float(NECK_SHINE_K) * shine_scale
 
     ao_top = float(NECK_CYLINDER_AO_TOP)
-    if vu is not None and vl is not None and vr is not None:
-        v_mid = 0.5 * (float(vl) + float(vr))
-        if v_mid > float(vu) + 4.0:
+    vl_e = by_lid.get(205, (None, None, None))[2]
+    vr_e = by_lid.get(425, (None, None, None))[2]
+    vu_e = by_lid.get(200, (None, None, None))[2]
+    if vu_e is not None and vl_e is not None and vr_e is not None:
+        v_mid = 0.5 * (float(vl_e) + float(vr_e))
+        if v_mid > float(vu_e) + 4.0:
             ao_top *= float(
                 np.clip(
                     1.0
                     + float(NECK_AO_CHIN_DARK_BOOST_COEF)
-                    * ((v_mid - float(vu)) / float(NECK_AO_CHIN_DARK_DIV)),
+                    * ((v_mid - float(vu_e)) / float(NECK_AO_CHIN_DARK_DIV)),
                     1.0,
                     1.45,
                 )
@@ -330,16 +385,8 @@ def estimate_face_lighting_for_neck(
         )
     )
 
-    skin_gx = 0.0
-    skin_gy = 0.0
-    if vl is not None and vr is not None:
-        skin_gx = float(
-            np.clip((float(vl) - float(vr)) / 255.0, -0.22, 0.22) * float(NECK_SKIN_GRAD_GAIN_LR)
-        )
-    if vf is not None and vu is not None:
-        skin_gy = float(
-            np.clip((float(vf) - float(vu)) / 255.0, -0.22, 0.22) * float(NECK_SKIN_GRAD_GAIN_FB)
-        )
+    skin_gx = float(np.clip(gx_norm, -0.22, 0.22) * float(NECK_SKIN_GRAD_GAIN_LR))
+    skin_gy = float(np.clip(-gy_norm, -0.22, 0.22) * float(NECK_SKIN_GRAD_GAIN_FB))
 
     return FaceNeckLightParams(
         x_axis_shift=axis_shift,
@@ -350,6 +397,7 @@ def estimate_face_lighting_for_neck(
         ao_top=ao_top,
         skin_grad_gx=skin_gx,
         skin_grad_gy=skin_gy,
+        light_sign=light_sign,
     )
 
 
@@ -765,45 +813,63 @@ def neck_cylinder_shade_map(
     k_shadow: Optional[float] = None,
     shine_k: Optional[float] = None,
     ao_top: Optional[float] = None,
+    light_sign: float = -1.0,
+    sss_alpha: float = NECK_CYLINDER_SSS_ALPHA,
 ) -> np.ndarray:
     """
     在整幅图上生成圆柱侧面亮度乘子 (h, w)。
 
-    - 水平：多边形 x 均值为轴，可叠加 ``x_axis_shift``（由左右颊亮度推断侧光）；``tanh`` 柔化径向；
-      **迎光侧**（画面左侧）用 ``k_lit`` 提亮，**背光侧**用 ``k_shadow`` 压暗（可由脸部对比度自适应）。
-    - 颌下 AO：到 **上沿折线**（``poly`` 前半链，对应下颌引导边）的距离变换，近颌弧压暗，
-      而非整条竖直线性带。
-    - 微弱水平高光带（``shine_k``），中心随 ``spec_x_shift`` 与轴一起平移。
-    - **mask 内对 L 做均值归一化到 1.0**，再 clip，避免整块脖子比采样肤色偏暗。
+    - **方向感知** 的 lit/sh：``light_sign=+1`` 表示主光从画面右侧（lit 在右），``-1`` 从左；
+      圆柱中线 = 多边形 x 均值 + ``x_axis_shift``；``tanh`` 柔化径向。
+    - **SSS 软化朝光面**：朝光侧 ``lit`` 不再是纯线性，而是 ``mix(lin, sqrt(lin), sss_alpha)``，
+      模拟皮肤次表面散射使光"绕过"曲面更多，过渡更软；背光侧保持线性（光不会绕到背面）。
+    - **双层高光**：窄 specular 峰（高频反射）+ 宽漫射 roll-off（皮肤主要还是漫反射），
+      能量按 ``NECK_SHINE_NARROW_SHARE`` 分配。中心位置为 ``x_axis + spec_x_shift``，
+      平光时再叠一点 ``light_sign * FLAT_LIGHT_FALLBACK_FRAC * R`` 偏置避免完全居中。
+    - 颌下 AO：到上沿折线的距离变换，近颌弧压暗。
+    - mask 内对 L 做均值归一化到 1.0，再 clip。
     """
     kL = float(NECK_CYLINDER_K_LIT if k_lit is None else k_lit)
     kS = float(NECK_CYLINDER_K_SHADOW if k_shadow is None else k_shadow)
     k_spec = float(NECK_SHINE_K if shine_k is None else shine_k)
     k_ao = float(NECK_CYLINDER_AO_TOP if ao_top is None else ao_top)
+    sign = float(np.sign(light_sign)) if abs(light_sign) > 1e-3 else -1.0
+    sss_a = float(np.clip(sss_alpha, 0.0, 1.0))
     xx = np.arange(w, dtype=np.float64)[np.newaxis, :]
-    yy = np.arange(h, dtype=np.float64)[:, np.newaxis]
     x_axis = float(np.mean(poly[:, 0])) + float(x_axis_shift)
     span = float(np.max(poly[:, 0]) - np.min(poly[:, 0]))
     R = max(span * 0.5, 4.0)
     radial = (xx - x_axis) / R
     radial = np.clip(radial, -1.45, 1.45)
     rad_s = np.tanh(radial * float(NECK_CYLINDER_TANH_SCALE))
-    # rad_s<0 → 画面左侧：迎光；rad_s>0 → 背光
-    lit = np.maximum(0.0, -rad_s)
-    sh = np.maximum(0.0, rad_s)
-    L = 1.0 + kL * lit - kS * sh
+    # 方向感知：sign=+1 → lit 在右（rad_s>0）；sign=-1 → lit 在左（rad_s<0）
+    lit_lin = np.maximum(0.0, sign * rad_s)
+    sh_lin = np.maximum(0.0, -sign * rad_s)
+    # 朝光面 SSS 软化（sqrt-like 让光绕过曲面更多）；背光面保线性
+    lit = (1.0 - sss_a) * lit_lin + sss_a * np.sqrt(np.maximum(lit_lin, 0.0))
+    L = 1.0 + kL * lit - kS * sh_lin
     y_min = float(np.min(poly[:, 1]))
     y_max = float(np.max(poly[:, 1]))
     depth = max(y_max - y_min, 1.0)
-    # 窄条高光（乘性），中心在轴左侧一点并叠加 spec_x_shift
-    sig = max(R * float(NECK_SHINE_SIGMA_FRAC), 2.5)
-    x_spec = (
-        x_axis
-        - R * float(NECK_SHINE_BASE_OFFSET_FRAC)
-        + float(spec_x_shift)
+
+    # 双层高光：窄 specular + 宽 diffuse roll-off
+    sig_n = max(R * float(NECK_SHINE_SIGMA_FRAC), 2.0)
+    sig_w = max(R * float(NECK_SHINE_DIFFUSE_SIGMA_FRAC), 4.0)
+    narrow_share = float(np.clip(NECK_SHINE_NARROW_SHARE, 0.0, 1.0))
+    # 平光（spec_x_shift 极小）时给一点点方向偏置，避免高光卡在轴中心显假
+    flat_fallback = 0.0
+    if abs(spec_x_shift) < 0.5 * R * float(NECK_SHINE_FLAT_LIGHT_FALLBACK_FRAC):
+        flat_fallback = sign * R * float(NECK_SHINE_FLAT_LIGHT_FALLBACK_FRAC)
+    x_spec = x_axis + float(spec_x_shift) + flat_fallback
+    shine_n = (k_spec * narrow_share) * np.exp(
+        -0.5 * np.square((xx - x_spec) / sig_n)
     )
-    shine = k_spec * np.exp(-0.5 * np.square((xx - x_spec) / sig))
+    shine_w = (k_spec * (1.0 - narrow_share)) * np.exp(
+        -0.5 * np.square((xx - x_spec) / sig_w)
+    )
+    shine = shine_n + shine_w
     L = L * (1.0 + shine)
+
     n_up = max(poly.shape[0] // 2, 2)
     upper = poly[:n_up].astype(np.float64)
     dt = distance_map_to_polyline(h, w, upper)
@@ -907,6 +973,7 @@ def build_natural_neck_layer(
         k_shadow=light.k_shadow,
         shine_k=light.shine_k,
         ao_top=light.ao_top,
+        light_sign=light.light_sign,
     )
     xx = np.arange(w, dtype=np.float64)[np.newaxis, :]
     yy = np.arange(h, dtype=np.float64)[:, np.newaxis]
