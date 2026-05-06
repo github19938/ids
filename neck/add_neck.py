@@ -113,6 +113,16 @@ NECK_SHINE_NARROW_SHARE = 0.55  # 0~1：能量分配到窄峰的比例，剩下�
 NECK_SHINE_FLAT_LIGHT_FALLBACK_FRAC = 0.04
 # 圆柱朝光面 SSS 软化系数（0=纯线性，1=完全 sqrt）：模拟皮肤次表面散射使光「绕过」曲面
 NECK_CYLINDER_SSS_ALPHA = 0.40
+
+# 解剖弱阴影：胸锁乳突肌（SCM）双侧斜向阴影带 + 中轴弱凸起（喉结/喉体），整体强度都很小，
+# 用 sin^2 余弦窗让它们在顶/底渐隐，避免穿过下颌或脖子底。
+NECK_ANATOMY_SCM_OFFSET_FRAC = 0.42  # SCM 中心相对圆柱半径 R 的横向偏移
+NECK_ANATOMY_SCM_SIGMA_FRAC = 0.10
+NECK_ANATOMY_SCM_DEPTH = 0.025  # 多大幅度的「压暗」（multiplier 减量）
+# 顶部/底部 SCM 的 V 形偏移（向外 spread）：模拟肌肉束从乳突到锁骨的走向
+NECK_ANATOMY_SCM_FLARE_FRAC = 0.18  # 自顶到底，SCM 中心向外多偏移 R 的多少
+NECK_ANATOMY_RIDGE_SIGMA_FRAC = 0.06
+NECK_ANATOMY_RIDGE_BRIGHT = 0.012  # 中轴凸起亮度提升（multiplier 增量），弱以适配男女
 # 脸部 V 对比度 → 圆柱 K / 高光强度缩放（平光弱、强侧光强）
 NECK_LIGHT_STRENGTH_LR_COEF = 2.0
 NECK_LIGHT_STRENGTH_RNG_COEF = 1.05
@@ -1007,6 +1017,25 @@ def neck_cylinder_shade_map(
     tau = max(depth * float(NECK_AO_DT_TAU_FRAC), float(NECK_AO_DT_TAU_MIN_PX))
     ao_w = np.exp(-dt / tau)
     L = L * (1.0 - k_ao * np.power(ao_w, 0.95))
+
+    # 解剖弱修饰：双侧 SCM（胸锁乳突肌）阴影带 + 中轴弱凸起。
+    yy = np.arange(h, dtype=np.float64)[:, np.newaxis]
+    yn = np.clip((yy - y_min) / depth, 0.0, 1.0)
+    vert_win = np.sin(np.pi * yn) ** 2  # 0 at top/bottom, 1 at middle，平滑过渡
+    # SCM 横向位置随深度自顶到底向外略 flare（V 形）
+    scm_offset = R * (
+        float(NECK_ANATOMY_SCM_OFFSET_FRAC)
+        + float(NECK_ANATOMY_SCM_FLARE_FRAC) * yn
+    )
+    sig_scm = max(R * float(NECK_ANATOMY_SCM_SIGMA_FRAC), 1.5)
+    g_l = np.exp(-0.5 * np.square((xx - (x_axis - scm_offset)) / sig_scm))
+    g_r = np.exp(-0.5 * np.square((xx - (x_axis + scm_offset)) / sig_scm))
+    L = L * (1.0 - float(NECK_ANATOMY_SCM_DEPTH) * (g_l + g_r) * vert_win)
+    # 中轴凸起：极弱亮带（性别中性）
+    sig_ridge = max(R * float(NECK_ANATOMY_RIDGE_SIGMA_FRAC), 1.0)
+    g_c = np.exp(-0.5 * np.square((xx - x_axis) / sig_ridge))
+    L = L * (1.0 + float(NECK_ANATOMY_RIDGE_BRIGHT) * g_c * vert_win)
+
     wm = mask > 0
     if np.any(wm):
         mu = float(np.mean(L[wm]))
