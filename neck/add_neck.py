@@ -72,6 +72,16 @@ NECK_SAT_SCALE_DEFAULT = 1.05
 # Reinhard Lab 颜色统计匹配（仅 mean shift）强度：把脖子 BGR 整体均值朝脸部肤色像素均值拉近
 NECK_TONE_MATCH_STRENGTH = 0.40
 
+# 原图 alpha 边缘 γ：suppress = (oa^gamma) * envelope；γ<1 让中间 α 区压制更猛、消除穿帮 halo
+NECK_SUPPRESS_ALPHA_GAMMA = 0.55
+
+# 已有脖子/衣领探测：在 chin 下方沿中心垂直条带探查 alpha 延伸，若较大则缩短假脖子
+COLLAR_PROBE_HALF_WIDTH_FRAC = 0.18      # 探查带宽 = jaw_span 的 ±18%
+COLLAR_PROBE_MAX_FRAC = 2.0              # 最远探到 jaw_span 的 2 倍
+COLLAR_ALPHA_THRESHOLD = 128             # alpha > 该阈值视为「已有内容」
+COLLAR_DETECT_MIN_FRAC = 0.30            # 延伸超过 jaw_span 的 30% → 认为图里已有脖子/衣领
+COLLAR_DEPTH_SHRINK_MIN_PX = 12.0        # 即便检出衣领，也至少留这么多脖子缝隙避免硬接
+
 # Film grain：脸部采样块灰度 std → 脖子 ``cv2.randn`` 标准差（自适应「包浆」）
 GRAIN_REF_GAIN_DEFAULT = 1.08
 GRAIN_SIGMA_MIN = 0.55
@@ -1368,16 +1378,48 @@ def build_natural_neck_layer(
             layer_u8, match_mask, ref_pixels, strength=float(tone_match_strength)
         )
 
-    # 距离驱动的 alpha 抑制：在脸部不透明区，越靠近下颌折线越压低脖子 alpha；越往脖子腹部越保留
+    # 距离驱动的 alpha 抑制：在脸部不透明区，越靠近下颌折线越压低脖子 alpha；越往脖子腹部越保留。
+    # 引入 gamma<1：对中间 α（脸部羽化边缘 0.3-0.7）也压得更猛，消除色相 halo。
     oa = bgra[:, :, 3].astype(np.float64) / 255.0
+    oa_gamma = np.power(oa, float(NECK_SUPPRESS_ALPHA_GAMMA))
     decay = float(max(span_for_scale * NECK_SUPPRESS_DECAY_FRAC, NECK_SUPPRESS_DECAY_MIN_PX))
     boundary_envelope = np.exp(-dt_upper / decay)
-    suppress = oa * boundary_envelope
+    suppress = oa_gamma * boundary_envelope
     layer_u8[:, :, 3] = np.clip(
         layer_u8[:, :, 3].astype(np.float64) * (1.0 - suppress), 0, 255
     ).astype(np.uint8)
 
     return layer_u8
+
+
+def estimate_existing_neck_extent_px(
+    bgra: np.ndarray,
+    chin_x: float,
+    chin_y: float,
+    jaw_span_px: float,
+) -> float:
+    """
+    沿 chin 下方一条 ±``COLLAR_PROBE_HALF_WIDTH_FRAC * jaw_span`` 宽的中心垂直条带，
+    测量 ``alpha > COLLAR_ALPHA_THRESHOLD`` 的连续延伸距离（自 chin_y 向下首个不达标行的位置）。
+    用于检测原图是否已经包含一段脖子 / 衣领；若 ``> jaw_span * COLLAR_DETECT_MIN_FRAC``，
+    上层应缩短假脖子的 ``neck_depth``，避免在已有内容上重复绘制。
+    """
+    h, w = bgra.shape[:2]
+    half = max(int(jaw_span_px * COLLAR_PROBE_HALF_WIDTH_FRAC), 4)
+    x0 = max(0, int(round(chin_x - half)))
+    x1 = min(w, int(round(chin_x + half)))
+    y_top = max(0, int(round(chin_y)))
+    y_bot = min(h, int(round(chin_y + jaw_span_px * COLLAR_PROBE_MAX_FRAC)))
+    if x1 <= x0 or y_bot <= y_top + 1:
+        return 0.0
+    strip_alpha = bgra[y_top:y_bot, x0:x1, 3]
+    row_med = np.median(strip_alpha, axis=1)
+    above = row_med > float(COLLAR_ALPHA_THRESHOLD)
+    if above.size == 0 or not bool(above[0]):
+        return 0.0
+    if bool(above.all()):
+        return float(above.size)
+    return float(int(np.argmin(above)))
 
 
 def make_face_mesh(
@@ -1541,6 +1583,23 @@ def add_fake_neck(
         )
     else:
         depth_override = None
+
+    # 检测原图已有的脖子 / 衣领延伸（chin 下方中心条带 alpha 探查）；
+    # 若延伸明显，把假脖子深度按 (planned - existing) 缩短，仅填补空缺。
+    chin_x_px, chin_y_px = landmark_xy(lm[LANDMARK_CHIN_BOTTOM], w, h)
+    existing_extent = estimate_existing_neck_extent_px(
+        bgra, chin_x_px, chin_y_px, jaw_span,
+    )
+    if existing_extent > jaw_span * float(COLLAR_DETECT_MIN_FRAC):
+        if depth_override is not None:
+            depth_override = max(
+                COLLAR_DEPTH_SHRINK_MIN_PX,
+                depth_override - existing_extent * 0.7,
+            )
+        # 重叠也减小一点，避免假脖子顶贴着原有衣领的硬过渡
+        overlap = float(np.clip(
+            overlap * 0.7, JAW_SPAN_OVERLAP_MIN_PX, JAW_SPAN_OVERLAP_MAX_PX
+        ))
 
     if pose_correction:
         yaw_rad, pitch_rad, roll_rad = estimate_head_pose(landmarks, w, h)
