@@ -809,6 +809,116 @@ def odd_kernel(size: int) -> int:
     return size
 
 
+# 用于 solvePnP 的标准 3D 人脸点（毫米单位，常见参考模型）：鼻尖、下巴、左右眼外角、左右嘴角
+HEAD_POSE_LANDMARKS = (1, 152, 33, 263, 61, 291)
+# 注意：image y 轴向下，所以 canonical Y 也用「向下为正」（与原文献的"向上为正"取负），
+# 这样 solvePnP 出来的 Euler 角与"图像 y-down"一致，正脸时 pitch≈0。
+HEAD_POSE_CANONICAL_3D = np.array([
+    [0.0,    0.0,    0.0],     # 鼻尖 (1)
+    [0.0,   63.6,  -12.5],     # 下巴 (152)，下巴在画面下方 → +Y
+    [-43.3, -32.7, -26.0],     # 左眼外角 (33)，眼睛在画面上方 → -Y
+    [43.3,  -32.7, -26.0],     # 右眼外角 (263)
+    [-28.9,  28.9, -24.1],     # 左嘴角 (61)
+    [28.9,   28.9, -24.1],     # 右嘴角 (291)
+], dtype=np.float64)
+
+# 姿态修正强度常量（弧度）
+POSE_PITCH_CHIN_OVERLAP_GAIN = 0.55     # chin_overlap *= clip(1 + gain * pitch, 0.55, 1.55)
+POSE_PITCH_CHIN_OVERLAP_MIN = 0.55
+POSE_PITCH_CHIN_OVERLAP_MAX = 1.55
+POSE_YAW_ASYM_INSET_GAIN = 0.30         # 顶边不对称 inset：远侧多 inset、近侧少 inset
+POSE_ROLL_MAX_RAD = 0.78                # ~45°，保护性 clip
+
+
+def estimate_head_pose(
+    landmarks,
+    w: int,
+    h: int,
+) -> Tuple[float, float, float]:
+    """
+    返回 ``(yaw, pitch, roll)``（弧度）。约定：
+    - yaw>0：头朝画面右侧转；
+    - pitch>0：仰头（颌下露出更多）；
+    - roll>0：头向画面右侧倾斜（眼线右端低于左端）。
+
+    采用混合策略：
+    1. **roll 必走"眼线角度"**——左眼 33 → 右眼 263 的方向角，几何上确定可靠，
+       不受 solvePnP 在 6 点退化情况下的影响；
+    2. **yaw / pitch 走 solvePnP**：6 个标准点 + 默认相机内参（fx=fy=w，主点=图像中心）；
+    3. 若 solvePnP 算出的 roll 与"眼线角度"差 >10°，认为求解器不稳定，
+       同步把 yaw / pitch 的幅度衰减 50%（保留方向）。
+
+    失败/退化时尽量返回 (0,0,roll_from_eye)，最差也能保证 roll 正确。
+    """
+    lm = landmarks.landmark
+    le = landmark_xy(lm[33], w, h)
+    re = landmark_xy(lm[263], w, h)
+    eye_dx = re[0] - le[0]
+    eye_dy = re[1] - le[1]
+    simple_roll = float(np.arctan2(eye_dy, eye_dx))
+
+    image_pts = np.array(
+        [landmark_xy(lm[i], w, h) for i in HEAD_POSE_LANDMARKS],
+        dtype=np.float64,
+    )
+    K = np.array(
+        [
+            [float(w), 0.0, float(w) * 0.5],
+            [0.0, float(w), float(h) * 0.5],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    dist = np.zeros((4, 1), dtype=np.float64)
+    yaw = 0.0
+    pitch = 0.0
+    pnp_roll = simple_roll
+    try:
+        success, rvec, _tvec = cv2.solvePnP(
+            HEAD_POSE_CANONICAL_3D, image_pts, K, dist,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+    except cv2.error:
+        success = False
+    if success:
+        Rmat, _ = cv2.Rodrigues(rvec)
+        sy = float(np.sqrt(Rmat[0, 0] ** 2 + Rmat[1, 0] ** 2))
+        if sy > 1e-6:
+            pnp_pitch = float(np.arctan2(Rmat[2, 1], Rmat[2, 2]))
+            pnp_yaw = float(np.arctan2(-Rmat[2, 0], sy))
+            pnp_roll = float(np.arctan2(Rmat[1, 0], Rmat[0, 0]))
+        else:
+            pnp_pitch = float(np.arctan2(-Rmat[1, 2], Rmat[1, 1]))
+            pnp_yaw = float(np.arctan2(-Rmat[2, 0], sy))
+            pnp_roll = 0.0
+        # image-y-down 下 solvePnP 的 pitch 是"低头为正"，反一下符号到"仰头为正"
+        yaw = pnp_yaw
+        pitch = -pnp_pitch
+        # 求解器与眼线角度差异 > 10° 视为退化，衰减 yaw / pitch
+        if abs(pnp_roll - simple_roll) > 0.175:
+            yaw *= 0.5
+            pitch *= 0.5
+
+    return (
+        float(np.clip(yaw, -POSE_ROLL_MAX_RAD, POSE_ROLL_MAX_RAD)),
+        float(np.clip(pitch, -POSE_ROLL_MAX_RAD, POSE_ROLL_MAX_RAD)),
+        float(np.clip(simple_roll, -POSE_ROLL_MAX_RAD, POSE_ROLL_MAX_RAD)),
+    )
+
+
+def rotate_xy(pts: np.ndarray, cx: float, cy: float, angle: float) -> np.ndarray:
+    """绕 (cx, cy) 旋转 (N,2) 点集；angle 弧度，正 = 画面 CCW（注意 OpenCV y 朝下，所以正向 = 顺时针视觉）。"""
+    if abs(float(angle)) < 1e-4:
+        return pts
+    c = float(np.cos(angle))
+    s = float(np.sin(angle))
+    dx = pts[:, 0] - float(cx)
+    dy = pts[:, 1] - float(cy)
+    nx = float(cx) + dx * c - dy * s
+    ny = float(cy) + dx * s + dy * c
+    return np.column_stack([nx, ny])
+
+
 def _face_oval_graph() -> dict[int, list[int]]:
     """MediaPipe FACE_OVAL 无向邻接表。"""
     graph: dict[int, list[int]] = {}
@@ -956,6 +1066,7 @@ def neck_cylinder_shade_map(
     ao_top: Optional[float] = None,
     light_sign: float = -1.0,
     sss_alpha: float = NECK_CYLINDER_SSS_ALPHA,
+    roll: float = 0.0,
 ) -> np.ndarray:
     """
     在整幅图上生成圆柱侧面亮度乘子 (h, w)。
@@ -977,11 +1088,16 @@ def neck_cylinder_shade_map(
     sign = float(np.sign(light_sign)) if abs(light_sign) > 1e-3 else -1.0
     sss_a = float(np.clip(sss_alpha, 0.0, 1.0))
     xx = np.arange(w, dtype=np.float64)[np.newaxis, :]
+    yy_g = np.arange(h, dtype=np.float64)[:, np.newaxis]
     x_axis = float(np.mean(poly[:, 0])) + float(x_axis_shift)
+    y_center = float(np.mean(poly[:, 1]))
     span = float(np.max(poly[:, 0]) - np.min(poly[:, 0]))
     R = max(span * 0.5, 4.0)
-    radial = (xx - x_axis) / R
-    radial = np.clip(radial, -1.45, 1.45)
+    # roll 把圆柱整体绕 (x_axis, y_center) 倾斜：径向 / 高光的「水平」方向变成 (cos, sin) 矢量。
+    cos_r = float(np.cos(roll))
+    sin_r = float(np.sin(roll))
+    x_perp = (xx - x_axis) * cos_r + (yy_g - y_center) * sin_r
+    radial = np.clip(x_perp / R, -1.45, 1.45)
     rad_s = np.tanh(radial * float(NECK_CYLINDER_TANH_SCALE))
     # 方向感知：sign=+1 → lit 在右（rad_s>0）；sign=-1 → lit 在左（rad_s<0）
     lit_lin = np.maximum(0.0, sign * rad_s)
@@ -993,7 +1109,7 @@ def neck_cylinder_shade_map(
     y_max = float(np.max(poly[:, 1]))
     depth = max(y_max - y_min, 1.0)
 
-    # 双层高光：窄 specular + 宽 diffuse roll-off
+    # 双层高光：窄 specular + 宽 diffuse roll-off；中心位置在「旋转后径向 = 偏移量 / R」处
     sig_n = max(R * float(NECK_SHINE_SIGMA_FRAC), 2.0)
     sig_w = max(R * float(NECK_SHINE_DIFFUSE_SIGMA_FRAC), 4.0)
     narrow_share = float(np.clip(NECK_SHINE_NARROW_SHARE, 0.0, 1.0))
@@ -1001,13 +1117,10 @@ def neck_cylinder_shade_map(
     flat_fallback = 0.0
     if abs(spec_x_shift) < 0.5 * R * float(NECK_SHINE_FLAT_LIGHT_FALLBACK_FRAC):
         flat_fallback = sign * R * float(NECK_SHINE_FLAT_LIGHT_FALLBACK_FRAC)
-    x_spec = x_axis + float(spec_x_shift) + flat_fallback
-    shine_n = (k_spec * narrow_share) * np.exp(
-        -0.5 * np.square((xx - x_spec) / sig_n)
-    )
-    shine_w = (k_spec * (1.0 - narrow_share)) * np.exp(
-        -0.5 * np.square((xx - x_spec) / sig_w)
-    )
+    spec_offset = float(spec_x_shift) + flat_fallback
+    spec_dist = x_perp - spec_offset
+    shine_n = (k_spec * narrow_share) * np.exp(-0.5 * np.square(spec_dist / sig_n))
+    shine_w = (k_spec * (1.0 - narrow_share)) * np.exp(-0.5 * np.square(spec_dist / sig_w))
     shine = shine_n + shine_w
     L = L * (1.0 + shine)
 
@@ -1018,22 +1131,25 @@ def neck_cylinder_shade_map(
     ao_w = np.exp(-dt / tau)
     L = L * (1.0 - k_ao * np.power(ao_w, 0.95))
 
-    # 解剖弱修饰：双侧 SCM（胸锁乳突肌）阴影带 + 中轴弱凸起。
-    yy = np.arange(h, dtype=np.float64)[:, np.newaxis]
-    yn = np.clip((yy - y_min) / depth, 0.0, 1.0)
-    vert_win = np.sin(np.pi * yn) ** 2  # 0 at top/bottom, 1 at middle，平滑过渡
-    # SCM 横向位置随深度自顶到底向外略 flare（V 形）
+    # 解剖弱修饰：双侧 SCM（胸锁乳突肌）阴影带 + 中轴弱凸起；与圆柱一同绕 roll 旋转。
+    # 沿"垂直"方向（旋转坐标 y_perp = -(xx-x_axis)*sin + (yy-y_center)*cos）计算 yn，
+    # 让 SCM 与中轴的"上下"始终对齐脖子主轴而不是图像 y 轴。
+    y_perp = -(xx - x_axis) * sin_r + (yy_g - y_center) * cos_r
+    half_h = max(depth * 0.5, 1.0)
+    yn = np.clip((y_perp / half_h) * 0.5 + 0.5, 0.0, 1.0)
+    vert_win = np.sin(np.pi * yn) ** 2
+    # SCM 横向位置随旋转后深度自顶到底向外略 flare（V 形）
     scm_offset = R * (
         float(NECK_ANATOMY_SCM_OFFSET_FRAC)
         + float(NECK_ANATOMY_SCM_FLARE_FRAC) * yn
     )
     sig_scm = max(R * float(NECK_ANATOMY_SCM_SIGMA_FRAC), 1.5)
-    g_l = np.exp(-0.5 * np.square((xx - (x_axis - scm_offset)) / sig_scm))
-    g_r = np.exp(-0.5 * np.square((xx - (x_axis + scm_offset)) / sig_scm))
+    g_l = np.exp(-0.5 * np.square((x_perp - (-scm_offset)) / sig_scm))
+    g_r = np.exp(-0.5 * np.square((x_perp - (+scm_offset)) / sig_scm))
     L = L * (1.0 - float(NECK_ANATOMY_SCM_DEPTH) * (g_l + g_r) * vert_win)
-    # 中轴凸起：极弱亮带（性别中性）
+    # 中轴凸起
     sig_ridge = max(R * float(NECK_ANATOMY_RIDGE_SIGMA_FRAC), 1.0)
-    g_c = np.exp(-0.5 * np.square((xx - x_axis) / sig_ridge))
+    g_c = np.exp(-0.5 * np.square(x_perp / sig_ridge))
     L = L * (1.0 + float(NECK_ANATOMY_RIDGE_BRIGHT) * g_c * vert_win)
 
     wm = mask > 0
@@ -1080,6 +1196,9 @@ def build_natural_neck_layer(
     jaw_span_px: Optional[float] = None,
     neck_depth_override_px: Optional[float] = None,
     tone_match_strength: float = NECK_TONE_MATCH_STRENGTH,
+    head_yaw: float = 0.0,
+    head_pitch: float = 0.0,
+    head_roll: float = 0.0,
 ) -> np.ndarray:
     """
     下颌引导多边形；mask 内 BGR = 采样肤色 × **局部线性肤色渐变** × **圆柱体明暗乘子**
@@ -1109,6 +1228,33 @@ def build_natural_neck_layer(
     poly = build_jaw_guided_neck_polygon(
         landmarks, w, h, overlap, neck_depth, flare_slim, top_inset=top_inset
     )
+
+    # 姿态修正之 yaw：远离相机的一侧（与 yaw 同号）顶边再多 inset 一点（更窄），
+    # 近相机一侧少 inset，让脖子的"近-远"对比与脸部 yaw 一致。
+    if abs(head_yaw) > 1e-3:
+        n_top_y = poly.shape[0] // 2
+        top = poly[:n_top_y]
+        bot = poly[n_top_y:]
+        cx_top = float(np.mean(top[:, 0]))
+        # yaw>0（头朝右转）：左半（x<cx）更靠近相机 → 少 inset；右半（x>cx）远 → 多 inset
+        sign_dir = np.sign(top[:, 0] - cx_top)  # +1 right, -1 left
+        extra_factor = 1.0 - float(POSE_YAW_ASYM_INSET_GAIN) * float(head_yaw) * sign_dir
+        extra_factor = np.clip(extra_factor, 0.7, 1.3)
+        top[:, 0] = cx_top + (top[:, 0] - cx_top) * extra_factor
+        # 底边按同样比例做（保持顶底连续）
+        sign_b = np.sign(bot[:, 0] - cx_top)
+        extra_b = 1.0 - float(POSE_YAW_ASYM_INSET_GAIN) * float(head_yaw) * sign_b
+        extra_b = np.clip(extra_b, 0.7, 1.3)
+        bot[:, 0] = cx_top + (bot[:, 0] - cx_top) * extra_b
+        poly = np.vstack([top, bot])
+
+    # 姿态修正之 roll：绕下巴点旋转整个多边形
+    if abs(head_roll) > 1e-3:
+        chin_x_lm, chin_y_lm = landmark_xy(landmarks.landmark[LANDMARK_CHIN_BOTTOM], w, h)
+        poly = rotate_xy(poly, chin_x_lm, chin_y_lm, head_roll)
+        poly[:, 0] = np.clip(poly[:, 0], 0.0, float(w - 1))
+        poly[:, 1] = np.clip(poly[:, 1], 0.0, float(h - 1))
+
     mask = fill_polygon_mask(h, w, poly)
 
     skin = np.array(skin_bgr, dtype=np.float64)
@@ -1134,6 +1280,7 @@ def build_natural_neck_layer(
         shine_k=light.shine_k,
         ao_top=light.ao_top,
         light_sign=light.light_sign,
+        roll=float(head_roll),
     )
     xx = np.arange(w, dtype=np.float64)[np.newaxis, :]
     yy = np.arange(h, dtype=np.float64)[:, np.newaxis]
@@ -1203,6 +1350,7 @@ def add_fake_neck(
     skin_s_scale: float = NECK_SAT_SCALE_DEFAULT,
     tone_match_strength: float = NECK_TONE_MATCH_STRENGTH,
     auto_scale_by_jaw: bool = True,
+    pose_correction: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     核心流程（自然衔接版）：
@@ -1282,6 +1430,20 @@ def add_fake_neck(
     else:
         depth_override = None
 
+    if pose_correction:
+        yaw_rad, pitch_rad, roll_rad = estimate_head_pose(landmarks, w, h)
+        # pitch 调 chin_overlap：仰头 (pitch>0) 颌下露出更多 → overlap 加大；俯首减小
+        pitch_scale = float(np.clip(
+            1.0 + POSE_PITCH_CHIN_OVERLAP_GAIN * pitch_rad,
+            POSE_PITCH_CHIN_OVERLAP_MIN, POSE_PITCH_CHIN_OVERLAP_MAX,
+        ))
+        overlap = float(np.clip(
+            overlap * pitch_scale,
+            JAW_SPAN_OVERLAP_MIN_PX, JAW_SPAN_OVERLAP_MAX_PX,
+        ))
+    else:
+        yaw_rad = pitch_rad = roll_rad = 0.0
+
     skin_bgr = sample_skin_color_bgra(
         bgra, landmarks, w, h,
         skin_v_scale=skin_v_scale,
@@ -1305,6 +1467,9 @@ def add_fake_neck(
         jaw_span_px=jaw_span,
         neck_depth_override_px=depth_override,
         tone_match_strength=tone_match_strength,
+        head_yaw=yaw_rad,
+        head_pitch=pitch_rad,
+        head_roll=roll_rad,
     )
     grain_ref = estimate_face_luminance_grain_std(bgra, landmarks, h, w)
     sharp_energy = estimate_face_high_freq_energy(bgra, landmarks, h, w)
