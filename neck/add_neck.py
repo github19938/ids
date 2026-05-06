@@ -220,15 +220,49 @@ def skin_patch_rect_at(
     return x0, y0, pw, ph
 
 
+# 经典 YCrCb 肤色范围（多数文献：Cr∈[133,173], Cb∈[77,127]）；用于过滤 patch 内的非肤色像素
+# （眉毛、睫毛、痣、刘海阴影等），让中值/V 均值更稳定。过滤后若有效像素 < 阈值则回退到 alpha 过滤
+# 以避免极端肤色或高光被错误剔除。
+SKIN_YCRCB_CR_MIN, SKIN_YCRCB_CR_MAX = 133, 173
+SKIN_YCRCB_CB_MIN, SKIN_YCRCB_CB_MAX = 77, 127
+SKIN_FILTER_MIN_COUNT = 4
+
+
+def _patch_skin_alpha_mask(roi_bgra: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    返回 (alpha_mask, skin_mask)：均为 (h,w) bool。
+    - alpha_mask: roi 内 alpha > 40 的像素；
+    - skin_mask: alpha_mask & YCrCb 肤色范围内的像素。
+    若 skin_mask 像素数 < SKIN_FILTER_MIN_COUNT，调用方应回退用 alpha_mask。
+    """
+    am = roi_bgra[:, :, 3].astype(np.float32) > 40.0
+    bgr = roi_bgra[:, :, :3]
+    if bgr.size == 0:
+        return am, np.zeros_like(am, dtype=bool)
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    cr = ycrcb[:, :, 1]
+    cb = ycrcb[:, :, 2]
+    skin = (
+        (cr >= SKIN_YCRCB_CR_MIN) & (cr <= SKIN_YCRCB_CR_MAX) &
+        (cb >= SKIN_YCRCB_CB_MIN) & (cb <= SKIN_YCRCB_CB_MAX)
+    )
+    return am, am & skin
+
+
 def median_bgr_in_patch(bgra: np.ndarray, x0: int, y0: int, pw: int, ph: int) -> Optional[np.ndarray]:
-    """patch 内 alpha>40 的像素 BGR 各通道取中值；无有效像素返回 None。"""
+    """
+    patch 内 **alpha>40 ∩ YCrCb 肤色范围内** 的像素 BGR 各通道取中值；
+    若肤色过滤后像素数 < ``SKIN_FILTER_MIN_COUNT``，回退到仅 alpha 过滤；
+    仍无有效像素则返回 None。
+    """
     if pw <= 0 or ph <= 0:
         return None
     roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
-    m = roi[:, :, 3].astype(np.float32) > 40.0
-    if not np.any(m):
+    am, sm = _patch_skin_alpha_mask(roi)
+    if not np.any(am):
         return None
-    flat = roi[:, :, :3][m].astype(np.float64)
+    use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
+    flat = roi[:, :, :3][use].astype(np.float64)
     if flat.shape[0] == 0:
         return None
     return np.median(flat, axis=0)
@@ -237,15 +271,21 @@ def median_bgr_in_patch(bgra: np.ndarray, x0: int, y0: int, pw: int, ph: int) ->
 def mean_hsv_v_in_patch(
     bgra: np.ndarray, x0: int, y0: int, pw: int, ph: int
 ) -> Optional[float]:
-    """patch 内 alpha>40 像素 HSV 的 V 通道均值；无有效像素返回 None。"""
+    """
+    patch 内 **alpha>40 ∩ YCrCb 肤色范围内** 像素 HSV 的 V 均值；
+    肤色过滤过严时回退到仅 alpha；无有效像素返回 None。
+    """
     if pw <= 0 or ph <= 0:
         return None
     roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
-    m = roi[:, :, 3].astype(np.float32) > 40.0
-    if not np.any(m):
+    am, sm = _patch_skin_alpha_mask(roi)
+    if not np.any(am):
         return None
+    use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
     hsv = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2HSV)
-    v = hsv[:, :, 2].astype(np.float64)[m]
+    v = hsv[:, :, 2].astype(np.float64)[use]
+    if v.size == 0:
+        return None
     return float(np.mean(v))
 
 
@@ -487,9 +527,10 @@ def gather_face_skin_pixels_bgr(
         if pw <= 0 or ph <= 0:
             continue
         roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
-        m = roi[:, :, 3].astype(np.float32) > 40.0
-        if np.any(m):
-            chunks.append(roi[:, :, :3][m])
+        am, sm = _patch_skin_alpha_mask(roi)
+        use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
+        if np.any(use):
+            chunks.append(roi[:, :, :3][use])
     if not chunks:
         return np.empty((0, 3), dtype=np.uint8)
     return np.vstack(chunks)
