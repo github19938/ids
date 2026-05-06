@@ -1380,6 +1380,73 @@ def build_natural_neck_layer(
     return layer_u8
 
 
+def make_face_mesh(
+    static_image_mode: bool = True,
+    max_num_faces: int = 1,
+    refine_landmarks: bool = True,
+    min_detection_confidence: float = 0.4,
+    min_tracking_confidence: float = 0.4,
+):
+    """
+    工厂函数：返回一个 MediaPipe FaceMesh 实例，便于在批量处理时复用同一个会话
+    （MediaPipe 模型加载本身有 ~100-300 ms 开销，复用可显著加速多图处理）。
+
+    使用方式：
+        with make_face_mesh() as fm:
+            for img in images:
+                bgra = ...
+                add_fake_neck(bgra, face_mesh=fm)
+    """
+    return mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=static_image_mode,
+        max_num_faces=max_num_faces,
+        refine_landmarks=refine_landmarks,
+        min_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=min_tracking_confidence,
+    )
+
+
+def _detect_first_face(face_mesh, rgb: np.ndarray):
+    """对外部传入的 FaceMesh 跑一次检测，返回第 1 张脸的 landmarks 或 None。"""
+    res = face_mesh.process(rgb)
+    if not res.multi_face_landmarks:
+        return None
+    return res.multi_face_landmarks[0]
+
+
+def detect_face_with_retry(rgb: np.ndarray):
+    """
+    带回退策略的人脸检测：
+    1. 先用默认参数（``min_detection_confidence=0.4``）跑一次；
+    2. 若失败、且图像最长边 < 1024，把图像放大到 ~1024 长边再跑（小头像友好）；
+    3. 若仍失败，把 ``min_detection_confidence`` 降到 0.2 再试一次（高遮挡/侧脸友好）；
+    4. 仍失败则返回 None。
+    """
+    h_img, w_img = rgb.shape[:2]
+    with make_face_mesh() as fm:
+        landmarks = _detect_first_face(fm, rgb)
+    if landmarks is not None:
+        return landmarks
+
+    longer = max(h_img, w_img)
+    if longer < 1024:
+        scale = 1024.0 / float(longer)
+        rh = int(round(h_img * scale))
+        rw = int(round(w_img * scale))
+        rgb_up = cv2.resize(rgb, (rw, rh), interpolation=cv2.INTER_LINEAR)
+        with make_face_mesh() as fm:
+            landmarks = _detect_first_face(fm, rgb_up)
+        if landmarks is not None:
+            return landmarks
+
+    with make_face_mesh(min_detection_confidence=0.2) as fm:
+        landmarks = _detect_first_face(fm, rgb)
+    if landmarks is not None:
+        return landmarks
+
+    return None
+
+
 def add_fake_neck(
     bgra: np.ndarray,
     neck_width_scale: float = 1.08,
@@ -1395,6 +1462,7 @@ def add_fake_neck(
     tone_match_strength: float = NECK_TONE_MATCH_STRENGTH,
     auto_scale_by_jaw: bool = True,
     pose_correction: bool = True,
+    face_mesh: Optional[object] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     核心流程（自然衔接版）：
@@ -1432,21 +1500,21 @@ def add_fake_neck(
     h, w = bgra.shape[:2]
     rgb = bgra_to_rgb(bgra)
 
-    mp_face_mesh = mp.solutions.face_mesh
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.4,
-        min_tracking_confidence=0.4,
-    ) as face_mesh:
-        results = face_mesh.process(rgb)
+    if face_mesh is not None:
+        landmarks = _detect_first_face(face_mesh, rgb)
+    else:
+        landmarks = None
+    if landmarks is None:
+        landmarks = detect_face_with_retry(rgb)
+    if landmarks is None:
+        raise RuntimeError(
+            "未检测到人脸：请确认图中包含完整面部且对比度正常。"
+            f" 当前图像 {w}x{h}，可尝试 (1) 提供更高分辨率原图；"
+            " (2) 检查抠图后人脸 alpha 是否完整未被裁切；"
+            " (3) 调小 min_detection_confidence。"
+        )
 
-    if not results.multi_face_landmarks:
-        raise RuntimeError("未检测到人脸，请确认图中包含完整面部且对比度正常。")
-
-    lm = results.multi_face_landmarks[0].landmark
-    landmarks = results.multi_face_landmarks[0]
+    lm = landmarks.landmark
     _, chin_y = landmark_xy(lm[LANDMARK_CHIN_BOTTOM], w, h)
 
     jaw_l_xy = landmark_xy(lm[LANDMARK_LEFT_JAW_ON_OVAL], w, h)
