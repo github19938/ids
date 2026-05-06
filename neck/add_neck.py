@@ -48,6 +48,30 @@ CHIN_OVERLAP_MAX_PX = 20.0
 # 脖子整体相对几何「变细」比例（<1）：同时缩小 **垂直深度** 与 **底边相对下颌的外扩量**，上沿仍贴下颌
 NECK_SLIM_SCALE_DEFAULT = 0.87
 
+# 上沿向中心收缩比例（<1）：让脖子在颌下「内收」一段，避免顶宽=下颌宽形成「双下巴」感。
+# 端点（172/397，下颌角附近）处保留 ~1.0（不动），中段最大收缩到该值，过渡用 |u|^0.7。
+NECK_TOP_INSET_DEFAULT = 0.86
+
+# 下颌跨度归一化：chin_overlap 与 neck_depth 默认按 172↔397 跨度自适应，避免硬编码像素带来分辨率敏感
+JAW_SPAN_OVERLAP_FRAC = 0.06
+JAW_SPAN_OVERLAP_MIN_PX = 6.0
+JAW_SPAN_OVERLAP_MAX_PX = 60.0
+JAW_SPAN_DEPTH_FRAC = 1.85
+JAW_SPAN_DEPTH_MIN_PX = 36.0
+
+# 沿「到上沿折线」的距离做的羽化/抑制（替代原来基于 chin_y 的硬过渡）
+NECK_FEATHER_FRAC = 0.025
+NECK_FEATHER_MIN_PX = 1.5
+NECK_FEATHER_MAX_PX = 8.0
+NECK_SUPPRESS_DECAY_FRAC = 0.06
+NECK_SUPPRESS_DECAY_MIN_PX = 4.0
+
+# 脖子相对脸部「色调偏暖偏暗」微调：在 HSV 上额外移 H、缩 S（V 已由 skin_v_scale 处理）
+NECK_HUE_SHIFT_DEFAULT = 1.6
+NECK_SAT_SCALE_DEFAULT = 1.05
+# Reinhard Lab 颜色统计匹配（仅 mean shift）强度：把脖子 BGR 整体均值朝脸部肤色像素均值拉近
+NECK_TONE_MATCH_STRENGTH = 0.40
+
 # Film grain：脸部采样块灰度 std → 脖子 ``cv2.randn`` 标准差（自适应「包浆」）
 GRAIN_REF_GAIN_DEFAULT = 1.08
 GRAIN_SIGMA_MIN = 0.55
@@ -329,14 +353,30 @@ def estimate_face_lighting_for_neck(
     )
 
 
-def _apply_bgr_value_scale(bgr: np.ndarray, v_scale: float) -> np.ndarray:
-    """在 HSV 中缩放 V 通道（OpenCV H∈[0,180], S,V∈[0,255]）。"""
+def _apply_neck_skin_tone(
+    bgr: np.ndarray,
+    v_scale: float,
+    h_shift: float = 0.0,
+    s_scale: float = 1.0,
+) -> np.ndarray:
+    """
+    在 HSV 中调整 V/S/H：
+    - V: ``*= v_scale``（默认 0.925 略压暗）；
+    - S: ``*= s_scale``（>1 略加饱和，颌下次表面散射使脖子色比脸略饱和）；
+    - H: ``+= h_shift``（OpenCV H∈[0,180]，正值向橙/暖偏，模拟皮肤 SSS 偏暖）。
+    """
     px = np.clip(np.round(bgr).astype(np.uint8).reshape(1, 1, 3), 0, 255)
     hsv = cv2.cvtColor(px, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv[0, 0, 2] *= float(v_scale)
-    hsv = np.clip(hsv, 0, 255)
+    hsv[0, 0, 0] = (hsv[0, 0, 0] + float(h_shift)) % 180.0
+    hsv[0, 0, 1] = float(np.clip(hsv[0, 0, 1] * float(s_scale), 0.0, 255.0))
+    hsv[0, 0, 2] = float(np.clip(hsv[0, 0, 2] * float(v_scale), 0.0, 255.0))
     out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)[0, 0].astype(np.float64)
     return out
+
+
+def _apply_bgr_value_scale(bgr: np.ndarray, v_scale: float) -> np.ndarray:
+    """向后兼容包装：等价于 ``_apply_neck_skin_tone(bgr, v_scale, 0.0, 1.0)``。"""
+    return _apply_neck_skin_tone(bgr, v_scale, 0.0, 1.0)
 
 
 def sample_skin_color_bgra(
@@ -345,6 +385,8 @@ def sample_skin_color_bgra(
     w: int,
     h: int,
     skin_v_scale: float = 0.925,
+    skin_h_shift: float = NECK_HUE_SHIFT_DEFAULT,
+    skin_s_scale: float = NECK_SAT_SCALE_DEFAULT,
 ) -> np.ndarray:
     """
     肤色采样：5 个核心区域，各取 ``patch×patch`` 子块（左右颊 ``SKIN_PATCH_CHEEK_PX``，
@@ -353,9 +395,12 @@ def sample_skin_color_bgra(
 
     权重：左颊 25% + 右颊 25% + 人中 20% + 额头 20% + 下巴上 10% = 100%。
 
-    最后对合成 BGR 做 HSV 的 **V 乘以 skin_v_scale**（默认约压暗 5%～10% 量级）。
+    最后对合成 BGR 做 HSV 调整：V*=skin_v_scale（默认略压暗），S*=skin_s_scale（略加饱和），
+    H+=skin_h_shift（向橙偏），共同模拟脖子相对脸部的「次表面散射偏暖偏暗略饱和」特征。
     """
     skin_v_scale = float(np.clip(skin_v_scale, 0.90, 0.95))
+    skin_h_shift = float(np.clip(skin_h_shift, -6.0, 6.0))
+    skin_s_scale = float(np.clip(skin_s_scale, 0.90, 1.20))
     ih, iw = bgra.shape[:2]
     lm = landmarks.landmark
     weighted: List[Tuple[float, np.ndarray]] = []
@@ -366,10 +411,74 @@ def sample_skin_color_bgra(
         if med is not None:
             weighted.append((float(wt), med.astype(np.float64)))
     if not weighted:
-        return _apply_bgr_value_scale(np.array([180.0, 200.0, 220.0], dtype=np.float64), skin_v_scale)
+        return _apply_neck_skin_tone(
+            np.array([180.0, 200.0, 220.0], dtype=np.float64),
+            skin_v_scale, skin_h_shift, skin_s_scale,
+        )
     sw = sum(w for w, _ in weighted)
     raw = sum(w * c for w, c in weighted) / max(sw, 1e-9)
-    return _apply_bgr_value_scale(raw, skin_v_scale)
+    return _apply_neck_skin_tone(raw, skin_v_scale, skin_h_shift, skin_s_scale)
+
+
+def gather_face_skin_pixels_bgr(
+    bgra: np.ndarray,
+    landmarks,
+    ih: int,
+    iw: int,
+    patch: int = 22,
+) -> np.ndarray:
+    """
+    在 5 个肤色采样点附近收集 **alpha>40** 的 BGR 像素，作为肤色统计参考池
+    （供 Reinhard Lab 颜色匹配使用，比单一加权均值更能表达分布）。
+    """
+    lm = landmarks.landmark
+    chunks: List[np.ndarray] = []
+    for lid, _, _, _ in SKIN_SAMPLE_REGIONS:
+        cx, cy = landmark_xy(lm[lid], iw, ih)
+        x0, y0, pw, ph = skin_patch_rect_at(cx, cy, ih, iw, patch)
+        if pw <= 0 or ph <= 0:
+            continue
+        roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
+        m = roi[:, :, 3].astype(np.float32) > 40.0
+        if np.any(m):
+            chunks.append(roi[:, :, :3][m])
+    if not chunks:
+        return np.empty((0, 3), dtype=np.uint8)
+    return np.vstack(chunks)
+
+
+def reinhard_lab_mean_shift_bgra_inplace(
+    layer_u8: np.ndarray,
+    mask_bool: np.ndarray,
+    ref_pixels_bgr: np.ndarray,
+    strength: float = NECK_TONE_MATCH_STRENGTH,
+) -> None:
+    """
+    对 ``layer_u8`` 在 ``mask_bool`` 内做 Reinhard Lab **均值偏移**（仅 mean shift，不改 std），
+    把脖子区域的整体色调朝 ``ref_pixels_bgr`` 的肤色均值拉近 ``strength`` 比例。
+
+    仅 shift mean、不改 std 的原因：脖子层已经包含我们故意做出的圆柱明暗与肤色渐变（std 信息），
+    若同时归一化 std 会把这些着色 wash 掉。
+    """
+    if ref_pixels_bgr.shape[0] < 8 or not np.any(mask_bool):
+        return
+    bgr = layer_u8[:, :, :3]
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    src = lab[mask_bool]
+    if src.shape[0] < 8:
+        return
+    src_mean = src.mean(axis=0)
+    ref_lab = cv2.cvtColor(
+        ref_pixels_bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB
+    ).reshape(-1, 3).astype(np.float32)
+    ref_mean = ref_lab.mean(axis=0)
+    s = float(np.clip(strength, 0.0, 1.0))
+    shift = (ref_mean - src_mean) * s
+    src_adj = src + shift
+    src_adj = np.clip(src_adj, 0.0, 255.0)
+    lab[mask_bool] = src_adj
+    out_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    layer_u8[:, :, :3] = out_bgr
 
 
 def estimate_face_luminance_grain_std(
@@ -582,16 +691,24 @@ def build_jaw_guided_neck_polygon(
     chin_overlap_px: float,
     neck_depth_px: float,
     bottom_flare: float,
+    top_inset: float = 1.0,
 ) -> np.ndarray:
     """
     构造闭合多边形：上边界 = 下颌下缘（FACE_OVAL 上 172—152—397 链），整体向上平移以插入下巴；
     下边界 = 上边界各点水平按 bottom_flare 从中心外扩、向下平移 neck_depth，形成上窄下宽。
+
+    ``top_inset`` (<1) 让上沿在颌下整体「内收」：所有上沿点（含端点 172/397）均按比例向中心收缩。
+    端点收缩后位于下颌轮廓**内侧**，上方被脸 alpha 遮蔽，不产生可见接缝；而多边形的左右边
+    （端点→底边）整体内移，**正下方可见的脖子侧宽 < 下颌宽**，符合"脖子比下颌窄"的解剖事实。
     返回 shape (N, 2) float64，闭合顺序为「上边界（下颌）左→右 + 下底边右→左」。
     """
     lm = landmarks.landmark
     idxs = jaw_index_path_through_chin()
     top = np.array([landmark_xy(lm[i], w, h) for i in idxs], dtype=np.float64)
     top = smooth_polyline_xy(top, win=5)
+    if float(top_inset) < 0.999:
+        cx_top = float(np.mean(top[:, 0]))
+        top[:, 0] = cx_top + (top[:, 0] - cx_top) * float(top_inset)
     top[:, 1] -= float(chin_overlap_px)
     cx = float(np.mean(top[:, 0]))
     bot_y = float(np.max(top[:, 1])) + float(neck_depth_px)
@@ -733,28 +850,40 @@ def build_natural_neck_layer(
     neck_bottom_flare: float,
     skin_bgr: np.ndarray,
     neck_slim_scale: float = NECK_SLIM_SCALE_DEFAULT,
+    neck_top_inset: float = NECK_TOP_INSET_DEFAULT,
+    jaw_span_px: Optional[float] = None,
+    neck_depth_override_px: Optional[float] = None,
+    tone_match_strength: float = NECK_TONE_MATCH_STRENGTH,
 ) -> np.ndarray:
     """
     下颌引导多边形；mask 内 BGR = 采样肤色 × **局部线性肤色渐变** × **圆柱体明暗乘子**
-    （径向 + 距离型 AO；K/高光/AO 由脸部 V 对比度自适应），alpha 恒为 255；
-    原图 alpha 抑制（不做高斯模糊）。
+    （径向 + 距离型 AO；K/高光/AO 由脸部 V 对比度自适应）；
+    再做 **Reinhard Lab 均值偏移** 把整体色调朝脸部肤色均值拉近 ``tone_match_strength`` 比例。
+
+    边缘处理：
+    - **mask 高斯羽化**：消硬边，过渡半径按 ``jaw_span_px`` 自适应（无该值则回退按图高近似）；
+    - **沿到上沿折线的距离做 sigmoid 抑制**：脸部不透明区在「靠近下颌弧」处压低脖子 alpha，
+      远离下颌弧（即靠近脖子腹部）保持满 alpha——比原 ``oa*(0.70+0.28*y_above_chin)`` 的硬过渡更自然。
 
     ``neck_slim_scale``：整体缩放脖子「粗细」（<1 变细），垂直深度与底边喇叭外扩同比缩小，上沿仍贴合下颌。
+    ``neck_top_inset``：上沿端点保持下颌角位置，中段向中心收缩，让脖子可见侧窄于下颌。
+    ``jaw_span_px``：172↔397 跨度（像素），用于把羽化/抑制衰减常数标定到与人脸大小同尺度。
+    ``neck_depth_override_px``：若提供则直接使用该值作脖子垂直深度（自适应路径），忽略 ``neck_height_ratio``。
     """
     slim = float(np.clip(neck_slim_scale, 0.72, 1.0))
-    neck_depth = max(8.0, float(h) * neck_height_ratio * 2.0) * slim
+    if neck_depth_override_px is not None:
+        neck_depth = max(8.0, float(neck_depth_override_px)) * slim
+    else:
+        neck_depth = max(8.0, float(h) * neck_height_ratio * 2.0) * slim
     effective_flare = float(neck_bottom_flare) * (float(neck_width_scale) / 1.08)
     effective_flare = max(1.02, min(effective_flare, 1.45))
-    # 只压缩相对中心的「额外宽度」：flare=1 无额外，>1 的部分乘以 slim
     flare_slim = 1.0 + (effective_flare - 1.0) * slim
+    top_inset = float(np.clip(neck_top_inset, 0.70, 1.0))
 
     poly = build_jaw_guided_neck_polygon(
-        landmarks, w, h, overlap, neck_depth, flare_slim
+        landmarks, w, h, overlap, neck_depth, flare_slim, top_inset=top_inset
     )
     mask = fill_polygon_mask(h, w, poly)
-
-    yy = np.arange(h, dtype=np.float64)[:, np.newaxis]
-    alpha_f = 255.0 * (mask.astype(np.float64) > 0.0)
 
     skin = np.array(skin_bgr, dtype=np.float64)
     wm = (mask > 0).astype(np.float64)
@@ -792,17 +921,40 @@ def build_natural_neck_layer(
         G = G / max(float(np.mean(G[wm_b])), 1e-6)
     bgr = skin * L[:, :, np.newaxis] * G[:, :, np.newaxis] * wm[:, :, np.newaxis]
 
+    # 上沿折线（poly 前半段）—— 用作距离场，驱动 alpha 抑制 / 羽化
+    n_up = max(poly.shape[0] // 2, 2)
+    upper_pts = poly[:n_up].astype(np.float64)
+    dt_upper = distance_map_to_polyline(h, w, upper_pts)
+
+    # mask 羽化：边缘有平滑过渡而非硬切边
+    span_for_scale = float(jaw_span_px) if jaw_span_px is not None else float(span_x)
+    feather_sigma = float(np.clip(
+        span_for_scale * NECK_FEATHER_FRAC, NECK_FEATHER_MIN_PX, NECK_FEATHER_MAX_PX
+    ))
+    feather_k = odd_kernel(int(round(feather_sigma * 3.0)) + 1)
+    mask_soft = cv2.GaussianBlur(
+        mask.astype(np.float32), (feather_k, feather_k), feather_sigma
+    ).astype(np.float64)
+    alpha_f = np.clip(mask_soft, 0.0, 255.0)
+
     layer = np.zeros((h, w, 4), dtype=np.float64)
-    layer[:, :, 0] = bgr[:, :, 0]
-    layer[:, :, 1] = bgr[:, :, 1]
-    layer[:, :, 2] = bgr[:, :, 2]
+    layer[:, :, :3] = bgr
     layer[:, :, 3] = alpha_f
     layer_u8 = np.clip(np.round(layer), 0, 255).astype(np.uint8)
 
-    # 原图不透明处减弱脖子（避免「贴纸」进脸；抠图透明区仍显示脖子）
+    # 颜色统计匹配：Reinhard Lab mean shift（仅迁移 mean，不动 std；保留圆柱明暗细节）
+    if tone_match_strength > 0.0:
+        ref_pixels = gather_face_skin_pixels_bgr(bgra, landmarks, h, w, patch=22)
+        match_mask = alpha_f > 8.0
+        reinhard_lab_mean_shift_bgra_inplace(
+            layer_u8, match_mask, ref_pixels, strength=float(tone_match_strength)
+        )
+
+    # 距离驱动的 alpha 抑制：在脸部不透明区，越靠近下颌折线越压低脖子 alpha；越往脖子腹部越保留
     oa = bgra[:, :, 3].astype(np.float64) / 255.0
-    y_above_chin = np.clip((float(chin_y) - yy.astype(np.float64)) / max(float(overlap) * 3.0, 1.0), 0.0, 1.0)
-    suppress = oa * (0.70 + 0.28 * y_above_chin)
+    decay = float(max(span_for_scale * NECK_SUPPRESS_DECAY_FRAC, NECK_SUPPRESS_DECAY_MIN_PX))
+    boundary_envelope = np.exp(-dt_upper / decay)
+    suppress = oa * boundary_envelope
     layer_u8[:, :, 3] = np.clip(
         layer_u8[:, :, 3].astype(np.float64) * (1.0 - suppress), 0, 255
     ).astype(np.uint8)
@@ -814,34 +966,49 @@ def add_fake_neck(
     bgra: np.ndarray,
     neck_width_scale: float = 1.08,
     neck_height_ratio: float = 0.26,
-    chin_overlap_px: float = 17.0,
+    chin_overlap_px: Optional[float] = None,
     neck_bottom_flare: float = 1.18,
     skin_v_scale: float = 0.925,
     neck_slim_scale: float = NECK_SLIM_SCALE_DEFAULT,
     grain_gain: float = GRAIN_REF_GAIN_DEFAULT,
+    neck_top_inset: float = NECK_TOP_INSET_DEFAULT,
+    skin_h_shift: float = NECK_HUE_SHIFT_DEFAULT,
+    skin_s_scale: float = NECK_SAT_SCALE_DEFAULT,
+    tone_match_strength: float = NECK_TONE_MATCH_STRENGTH,
+    auto_scale_by_jaw: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     核心流程（自然衔接版）：
-    1) FaceMesh 检测人脸；下巴 **152**；
+    1) FaceMesh 检测人脸；下巴 **152**；并计算 **下颌跨度** ``jaw_span = ||172-397||``；
     2) **下颌路径**：在 FACE_OVAL 上 BFS **172→152→397**（下颌下缘），得到上边界折线，
-       整体上移 `chin_overlap_px` 以插入下巴后缘；
-    3) **上窄下宽**：下边界相对水平中心外扩（``neck_bottom_flare``）后再下移；经 ``neck_slim_scale``
-       同比缩小「深度 + 外扩量」，脖子整体变细，上沿仍贴下颌；
-    4) **颜色**：5 区采样 + HSV 压 V 得 albedo；mask 内乘 **关键点推断的肤色渐变 + 圆柱明暗**
-      （V 对比度自适应 K/高光/AO，颌线距离型 AO）；alpha 满值；
-    5) **Film grain**：按脸部采样块灰度标准差自适应强度，对脖子 RGB 叠加 ``cv2.randn`` 弱噪点；
-    6) **原图 alpha**：脸部不透明区域按比例压低脖子 alpha，减少穿帮；
+       整体上移 `chin_overlap_px` 以插入下巴后缘；``auto_scale_by_jaw`` 时该值与脖子深度均按
+       jaw_span 自适应（替代硬编码相对图高）；
+    3) **上窄下宽**：上沿端点处保留下颌角形态、中段按 ``neck_top_inset`` 向中心收缩，
+       下边界相对水平中心外扩（``neck_bottom_flare``）后再下移；经 ``neck_slim_scale`` 同比缩小
+       「深度 + 外扩量」；
+    4) **颜色**：5 区采样 + HSV 调整（V 压暗 + S 略加饱和 + H 略偏暖）得 albedo；
+       mask 内乘 **关键点推断的肤色渐变 + 圆柱明暗**（V 对比度自适应 K/高光/AO，颌线距离型 AO）；
+       再做 **Reinhard Lab 均值偏移** 把脖子整体色调朝脸部肤色均值拉近 ``tone_match_strength`` 比例；
+    5) **边缘**：mask 高斯羽化（消硬边）+ 沿到上沿折线的距离做 sigmoid 抑制（替代基于 chin_y 的硬过渡）；
+    6) **Film grain**：按脸部采样块灰度标准差自适应强度，对脖子 RGB 叠加 ``cv2.randn`` 弱噪点；
     7) **层级**：`alpha_over(脖子, 头像)`，脖子在下。
 
     :return: ``(合成图 BGRA, 肤色采样标注图 BGRA)``，后者与输入同尺寸，便于核对取样区域。
 
     :param neck_width_scale: 与 `neck_bottom_flare` 联动微调整体外扩（默认 1.08 为基准）。
-    :param neck_height_ratio: 控制脖子区域垂直深度（相对图高）。
+    :param neck_height_ratio: 控制脖子区域垂直深度（相对图高）。``auto_scale_by_jaw=True`` 时被忽略。
     :param neck_bottom_flare: 下颌底相对顶宽的水平放大（喇叭），约 1.12–1.25。
-    :param chin_overlap_px: 顶边相对 152 向上偏移像素，钳制在 15–20。
+    :param chin_overlap_px: 顶边相对 152 向上偏移像素；``None`` + ``auto_scale_by_jaw=True`` 时按
+        jaw_span 自适应（``jaw_span * 0.06``，钳 6–60 px）；显式传值则使用该值（钳 6–60）。
     :param skin_v_scale: 采样肤色后在 HSV 中对 V 的乘子，建议 0.90–0.95（默认 0.925）。
     :param neck_slim_scale: 脖子整体变细比例（0.72–1），默认 0.87；同比缩小深度与底边外扩。
     :param grain_gain: 脸部灰度 std → 脖子噪点 std 的倍率，默认见 ``GRAIN_REF_GAIN_DEFAULT``。
+    :param neck_top_inset: 上沿中段向中心收缩比例（0.70–1.0），默认 0.86，让脖子可见侧窄于下颌。
+    :param skin_h_shift: 采样肤色 HSV 中 H 偏移（OpenCV H∈[0,180]，正向橙偏），默认 1.6。
+    :param skin_s_scale: 采样肤色 HSV 中 S 缩放，默认 1.05（略加饱和）。
+    :param tone_match_strength: Reinhard Lab 均值偏移强度（0=关，1=完全对齐脸部均值），默认 0.40。
+    :param auto_scale_by_jaw: 若 True 且 ``chin_overlap_px is None``，按 jaw_span 自动定 overlap、
+        depth 与边缘羽化/抑制衰减常数，使行为不随分辨率变化；False 时退回原相对图高的硬编码尺寸。
     """
     h, w = bgra.shape[:2]
     rgb = bgra_to_rgb(bgra)
@@ -863,10 +1030,36 @@ def add_fake_neck(
     landmarks = results.multi_face_landmarks[0]
     _, chin_y = landmark_xy(lm[LANDMARK_CHIN_BOTTOM], w, h)
 
-    overlap = float(np.clip(chin_overlap_px, CHIN_OVERLAP_MIN_PX, CHIN_OVERLAP_MAX_PX))
+    jaw_l_xy = landmark_xy(lm[LANDMARK_LEFT_JAW_ON_OVAL], w, h)
+    jaw_r_xy = landmark_xy(lm[LANDMARK_RIGHT_JAW_ON_OVAL], w, h)
+    jaw_span = float(np.hypot(jaw_l_xy[0] - jaw_r_xy[0], jaw_l_xy[1] - jaw_r_xy[1]))
+    jaw_span = max(jaw_span, 12.0)
+
+    if chin_overlap_px is None:
+        if auto_scale_by_jaw:
+            overlap = float(np.clip(
+                jaw_span * JAW_SPAN_OVERLAP_FRAC,
+                JAW_SPAN_OVERLAP_MIN_PX, JAW_SPAN_OVERLAP_MAX_PX,
+            ))
+        else:
+            overlap = float(np.clip(17.0, JAW_SPAN_OVERLAP_MIN_PX, JAW_SPAN_OVERLAP_MAX_PX))
+    else:
+        overlap = float(np.clip(
+            chin_overlap_px, JAW_SPAN_OVERLAP_MIN_PX, JAW_SPAN_OVERLAP_MAX_PX
+        ))
+
+    if auto_scale_by_jaw:
+        depth_override: Optional[float] = max(
+            jaw_span * JAW_SPAN_DEPTH_FRAC, JAW_SPAN_DEPTH_MIN_PX
+        )
+    else:
+        depth_override = None
 
     skin_bgr = sample_skin_color_bgra(
-        bgra, landmarks, w, h, skin_v_scale=skin_v_scale
+        bgra, landmarks, w, h,
+        skin_v_scale=skin_v_scale,
+        skin_h_shift=skin_h_shift,
+        skin_s_scale=skin_s_scale,
     )
 
     neck_layer = build_natural_neck_layer(
@@ -881,6 +1074,10 @@ def add_fake_neck(
         neck_bottom_flare,
         skin_bgr,
         neck_slim_scale=neck_slim_scale,
+        neck_top_inset=neck_top_inset,
+        jaw_span_px=jaw_span,
+        neck_depth_override_px=depth_override,
+        tone_match_strength=tone_match_strength,
     )
     grain_ref = estimate_face_luminance_grain_std(bgra, landmarks, h, w)
     neck_layer = apply_film_grain_to_neck_bgra(neck_layer, grain_ref, grain_gain=grain_gain)
@@ -928,8 +1125,9 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument(
         "--chin-overlap",
         type=float,
-        default=17.0,
-        help="脖子顶相对下巴点(152)向上偏移像素，建议 15–20，会钳制到该范围，默认 17",
+        default=-1.0,
+        help="脖子顶相对下巴点(152)向上偏移像素；<0 表示按下颌跨度自适应（默认）。"
+        "显式传值会被钳到 6–60 px",
     )
     parser.add_argument(
         "--neck-bottom-flare",
@@ -955,6 +1153,38 @@ def main(argv: Optional[list] = None) -> int:
         default=GRAIN_REF_GAIN_DEFAULT,
         help="脸部灰度标准差映射到脖子 film grain 强度的倍率，默认 1.08",
     )
+    parser.add_argument(
+        "--neck-top-inset",
+        type=float,
+        default=NECK_TOP_INSET_DEFAULT,
+        help="上沿中段向中心收缩比例（0.70–1.0），默认 0.86；"
+        "端点保留下颌角形态，让脖子可见侧窄于下颌（避免双下巴感）",
+    )
+    parser.add_argument(
+        "--skin-h-shift",
+        type=float,
+        default=NECK_HUE_SHIFT_DEFAULT,
+        help="肤色 HSV 中 H 偏移（OpenCV H∈[0,180]，正向橙偏），默认 1.6",
+    )
+    parser.add_argument(
+        "--skin-s-scale",
+        type=float,
+        default=NECK_SAT_SCALE_DEFAULT,
+        help="肤色 HSV 中 S 缩放（>1 略加饱和），默认 1.05",
+    )
+    parser.add_argument(
+        "--tone-match",
+        type=float,
+        default=NECK_TONE_MATCH_STRENGTH,
+        help="Reinhard Lab 均值偏移强度（0=关，1=完全对齐脸部肤色均值），默认 0.40",
+    )
+    parser.add_argument(
+        "--no-auto-scale",
+        dest="auto_scale_by_jaw",
+        action="store_false",
+        help="禁用按下颌跨度自适应；改用 --neck-height-ratio 等基于图高的硬编码相对量",
+    )
+    parser.set_defaults(auto_scale_by_jaw=True)
     args = parser.parse_args(argv)
 
     inp = os.path.abspath(args.input)
@@ -963,16 +1193,24 @@ def main(argv: Optional[list] = None) -> int:
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
     bgra = load_rgba(inp)
+    chin_overlap_arg: Optional[float] = (
+        None if args.chin_overlap is None or args.chin_overlap < 0 else float(args.chin_overlap)
+    )
     try:
         out_bgra, skin_marked = add_fake_neck(
             bgra,
             neck_width_scale=args.neck_width_scale,
             neck_height_ratio=args.neck_height_ratio,
-            chin_overlap_px=args.chin_overlap,
+            chin_overlap_px=chin_overlap_arg,
             neck_bottom_flare=args.neck_bottom_flare,
             skin_v_scale=args.skin_v_scale,
             neck_slim_scale=float(np.clip(args.neck_slim, 0.72, 1.0)),
             grain_gain=float(np.clip(args.grain_gain, 0.35, 2.5)),
+            neck_top_inset=float(np.clip(args.neck_top_inset, 0.70, 1.0)),
+            skin_h_shift=float(np.clip(args.skin_h_shift, -6.0, 6.0)),
+            skin_s_scale=float(np.clip(args.skin_s_scale, 0.90, 1.20)),
+            tone_match_strength=float(np.clip(args.tone_match, 0.0, 1.0)),
+            auto_scale_by_jaw=bool(args.auto_scale_by_jaw),
         )
     except Exception as e:
         print(f"[错误] {e}", file=sys.stderr)
