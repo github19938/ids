@@ -1505,6 +1505,7 @@ def add_fake_neck(
     auto_scale_by_jaw: bool = True,
     pose_correction: bool = True,
     face_mesh: Optional[object] = None,
+    use_pink_noise: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     核心流程（自然衔接版）：
@@ -1646,7 +1647,8 @@ def add_fake_neck(
     sharp_energy = estimate_face_high_freq_energy(bgra, landmarks, h, w)
     sharp_factor = float(np.clip(sharp_energy / SHARP_REF, SHARP_FACTOR_MIN, SHARP_FACTOR_MAX))
     neck_layer = apply_film_grain_to_neck_bgra(
-        neck_layer, grain_ref, grain_gain=grain_gain, sharp_factor=sharp_factor
+        neck_layer, grain_ref, grain_gain=grain_gain,
+        sharp_factor=sharp_factor, use_pink_noise=use_pink_noise,
     )
 
     composed = alpha_over(neck_layer, bgra)
@@ -1752,6 +1754,20 @@ def main(argv: Optional[list] = None) -> int:
         help="禁用按下颌跨度自适应；改用 --neck-height-ratio 等基于图高的硬编码相对量",
     )
     parser.set_defaults(auto_scale_by_jaw=True)
+    parser.add_argument(
+        "--no-pose-correction",
+        dest="pose_correction",
+        action="store_false",
+        help="禁用头部姿态（yaw/pitch/roll）校正：脖子永远垂直、对称、无 pitch overlap",
+    )
+    parser.set_defaults(pose_correction=True)
+    parser.add_argument(
+        "--white-noise",
+        dest="use_pink_noise",
+        action="store_false",
+        help="使用 cv2.randn 白噪声代替 1/f pink noise（默认 pink，更接近皮肤纹理）",
+    )
+    parser.set_defaults(use_pink_noise=True)
     args = parser.parse_args(argv)
 
     inp = os.path.abspath(args.input)
@@ -1778,6 +1794,8 @@ def main(argv: Optional[list] = None) -> int:
             skin_s_scale=float(np.clip(args.skin_s_scale, 0.90, 1.20)),
             tone_match_strength=float(np.clip(args.tone_match, 0.0, 1.0)),
             auto_scale_by_jaw=bool(args.auto_scale_by_jaw),
+            pose_correction=bool(args.pose_correction),
+            use_pink_noise=bool(args.use_pink_noise),
         )
     except Exception as e:
         print(f"[错误] {e}", file=sys.stderr)
