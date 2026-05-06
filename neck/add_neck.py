@@ -598,21 +598,111 @@ def estimate_face_luminance_grain_std(
     return max(stds)
 
 
+# 1/f 噪声 / Laplacian 锐度参考阈值。SHARP_REF 是经验值：
+# 大部分自然 8-bit 人像在 16x16 patch 上 |Laplacian| 均值 ~3-5；过强意味着图像很锐，过弱意味着糊。
+SHARP_REF = 4.0
+SHARP_FACTOR_MIN = 0.45
+SHARP_FACTOR_MAX = 1.55
+PINK_NOISE_ALPHA = 1.0  # 功率谱 ∝ 1/f^alpha；alpha=1 (1/f noise) 接近自然皮肤纹理频谱
+
+
+def generate_pink_noise_2d(
+    h: int,
+    w: int,
+    sigma: float,
+    alpha: float = PINK_NOISE_ALPHA,
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """
+    生成 (h, w) float32 的 1/f^alpha 噪声场（功率谱按频率倒数衰减），
+    最后归一化到目标标准差 ``sigma``。
+
+    与白噪声相比，pink noise 在中低频能量更强、空间相关性显著，
+    上叠在脖子皮肤上更接近真实皮肤"毛孔+细纹"的统计特性，而不是干净相机噪声。
+    """
+    rng = np.random.default_rng(seed)
+    white = rng.standard_normal((h, w)).astype(np.float32)
+    F = np.fft.fft2(white)
+    fx = np.fft.fftfreq(w).astype(np.float32)
+    fy = np.fft.fftfreq(h).astype(np.float32)
+    Fx, Fy = np.meshgrid(fx, fy)
+    radius = np.sqrt(Fx * Fx + Fy * Fy)
+    # 避免 DC 分量被无限放大；DC（频率=0）直接置 0
+    safe_r = np.where(radius > 0, radius, 1.0)
+    scale = (1.0 / safe_r) ** (alpha / 2.0)
+    scale = scale.astype(np.float32)
+    scale[0, 0] = 0.0
+    pink = np.real(np.fft.ifft2(F * scale)).astype(np.float32)
+    s = float(pink.std())
+    if s > 1e-6:
+        pink *= float(sigma) / s
+    return pink
+
+
+def estimate_face_high_freq_energy(
+    bgra: np.ndarray,
+    landmarks,
+    ih: int,
+    iw: int,
+) -> float:
+    """
+    在肤色采样块内对灰度做 Laplacian，取 ``|Lap|`` 在 alpha&肤色掩码下的均值，
+    各块之间取 **中位数**（比 max 更鲁棒，不会被一个极端 patch 拉偏）。
+
+    返回值越大表示原图越锐；用作 film grain σ 的额外缩放因子，
+    避免在被美颜/平滑过的图上把噪点叠得比脸还粗。
+    """
+    lm = landmarks.landmark
+    vals: List[float] = []
+    for lid, _, _, psize in SKIN_SAMPLE_REGIONS:
+        cx, cy = landmark_xy(lm[lid], iw, ih)
+        psize_use = max(int(psize), 12)
+        x0, y0, pw, ph = skin_patch_rect_at(cx, cy, ih, iw, psize_use)
+        if pw <= 0 or ph <= 0:
+            continue
+        roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
+        am, sm = _patch_skin_alpha_mask(roi)
+        use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
+        if not np.any(use):
+            continue
+        gray = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+        vals.append(float(np.mean(np.abs(lap[use]))))
+    if not vals:
+        return SHARP_REF
+    return float(np.median(vals))
+
+
 def apply_film_grain_to_neck_bgra(
     neck_bgra: np.ndarray,
     face_grain_std: float,
     grain_gain: float = GRAIN_REF_GAIN_DEFAULT,
+    sharp_factor: float = 1.0,
+    use_pink_noise: bool = True,
+    seed: Optional[int] = None,
 ) -> np.ndarray:
     """
-    在脖子图层 **RGB** 上叠加微弱高斯白噪声（``cv2.randn``），**不改 alpha**。
-    标准差 ``sigma = clip(face_grain_std * grain_gain, GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX)``，
-    仅在 alpha>8 的像素上叠加，避免污染全透明区。
+    在脖子图层 **RGB** 上叠加微弱噪声（默认 **1/f pink noise**，3 通道独立），不改 alpha。
+
+    ``sigma = clip(face_grain_std * grain_gain * sharp_factor,
+                   GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX)``
+
+    其中 ``sharp_factor`` 由脸部 Laplacian 高频能量驱动（``estimate_face_high_freq_energy``），
+    平滑/美颜过的脸 sharp_factor 自动小于 1，避免脖子上叠出比脸更粗的颗粒。
     """
     gain = float(np.clip(grain_gain, 0.35, 2.5))
-    sigma = float(np.clip(face_grain_std * gain, GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX))
+    sf = float(np.clip(sharp_factor, SHARP_FACTOR_MIN, SHARP_FACTOR_MAX))
+    sigma = float(np.clip(face_grain_std * gain * sf, GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX))
     h, w = neck_bgra.shape[:2]
-    noise = np.zeros((h, w, 3), dtype=np.float32)
-    cv2.randn(noise, (0.0, 0.0, 0.0), (sigma, sigma, sigma))
+    if use_pink_noise:
+        seed_val = seed if seed is not None else 0
+        noise = np.stack([
+            generate_pink_noise_2d(h, w, sigma, seed=seed_val + i * 7919)
+            for i in range(3)
+        ], axis=-1)
+    else:
+        noise = np.zeros((h, w, 3), dtype=np.float32)
+        cv2.randn(noise, (0.0, 0.0, 0.0), (sigma, sigma, sigma))
     m = (neck_bgra[:, :, 3].astype(np.float32) > 8.0)[:, :, np.newaxis]
     rgb = neck_bgra[:, :, :3].astype(np.float32) + noise * m
     out = neck_bgra.copy()
@@ -1188,7 +1278,11 @@ def add_fake_neck(
         tone_match_strength=tone_match_strength,
     )
     grain_ref = estimate_face_luminance_grain_std(bgra, landmarks, h, w)
-    neck_layer = apply_film_grain_to_neck_bgra(neck_layer, grain_ref, grain_gain=grain_gain)
+    sharp_energy = estimate_face_high_freq_energy(bgra, landmarks, h, w)
+    sharp_factor = float(np.clip(sharp_energy / SHARP_REF, SHARP_FACTOR_MIN, SHARP_FACTOR_MAX))
+    neck_layer = apply_film_grain_to_neck_bgra(
+        neck_layer, grain_ref, grain_gain=grain_gain, sharp_factor=sharp_factor
+    )
 
     composed = alpha_over(neck_layer, bgra)
     skin_marked = render_skin_sample_marked_preview(bgra, landmarks)
