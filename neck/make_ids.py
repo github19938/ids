@@ -37,14 +37,14 @@ class MakeIDPhoto:
     # ============ 脖子几何参数（经验值）============
     NECK_TOP_INSET = 0.95        # 脖子顶宽 / 下颌宽（接近 1 = 几乎=下颌宽）
     NECK_BOTTOM_FLARE = 1.0      # 脖子底宽 / 顶宽（不外扩）
-    NECK_DEPTH_FRAC = 1.10       # 脖子高度 = jaw_span × 此值
+    NECK_DEPTH_FRAC = 1.50       # 脖子 polygon 高度 = jaw_span × 此值（要 ≥ visible+buffer）
     CHIN_OVERLAP_FRAC = 0.06     # 脖子上沿向上插入下巴的距离 / jaw_span
-    NECK_DRAWING_PAD_FACTOR = 1.5  # 加脖子前底部预留 padding = jaw_span × 此值
+    NECK_DRAWING_PAD_FACTOR = 2.0  # 加脖子前底部预留 padding = jaw_span × 此值（≥ NECK_DEPTH_FRAC）
 
     # ============ 衣服 / 画布几何参数（经验值）============
     HEAD_JAW_TO_CANVAS_RATIO = 0.20   # canvas 上 scaled_jaw_span / canvas_w
     HEAD_TOP_MARGIN_RATIO = 0.11      # 头顶 margin / canvas_w
-    NECK_VISIBLE_TO_JAW_RATIO = 0.70  # 脖子可见高度 / scaled_jaw_span
+    NECK_VISIBLE_TO_JAW_RATIO = 0.95  # 脖子可见高度 / scaled_jaw_span（0.70→0.95 让脖子更长）
     CLOTHES_VNECK_X_FRAC = 0.50       # 衣服 V 领 fallback x 位置 / clothes_w
     CLOTHES_VNECK_Y_FRAC = 0.18       # 衣服 V 领 fallback y 位置 / clothes_h
 
@@ -64,6 +64,7 @@ class MakeIDPhoto:
         clothes_path: str,
         output_path: str,
         bg_hex: str = DEFAULT_BG_HEX,
+        neck_visible_ratio: Optional[float] = None,
     ):
         """
         :param head_path: 抠图头像路径（RGBA PNG，背景透明）
@@ -71,12 +72,18 @@ class MakeIDPhoto:
         :param clothes_path: 衣服模板路径（RGBA PNG，衣服外背景透明）
         :param output_path: 输出证件照路径
         :param bg_hex: 16 进制底色，支持 '#RGB' / '#RRGGBB' / 'RRGGBB' / '0xRRGGBB'
+        :param neck_visible_ratio: 脖子可见高度 / scaled_jaw_span，覆盖默认值 0.95；
+            想脖子更长传 1.10~1.30，更短传 0.60~0.80。None=用默认。
         """
         self.head_path = head_path
         self.source_path = source_path
         self.clothes_path = clothes_path
         self.output_path = output_path
         self.bg_bgr = self._hex_to_bgr(bg_hex)
+        if neck_visible_ratio is not None:
+            self.neck_visible_ratio = float(np.clip(neck_visible_ratio, 0.30, 1.80))
+        else:
+            self.neck_visible_ratio = self.NECK_VISIBLE_TO_JAW_RATIO
 
     # =================================================================================
     # 主流程
@@ -117,6 +124,53 @@ class MakeIDPhoto:
     # 核心方法 1：加脖子（affine warp 原图脖子像素到头像坐标系）
     # =================================================================================
 
+    # 在 warp 前要把 source 真实脖子之下（衣领 / T 恤等非肤色区）替换为脖子 mean 色，
+    # 避免 transplant 把白衣领等非脖子内容拷到头像上。
+    SOURCE_REAL_NECK_TOP_FRAC = 0.10   # 真实脖子起始 y = source_chin + 0.10 × source_jaw_span
+    SOURCE_REAL_NECK_BOT_FRAC = 0.45   # 真实脖子结束 y = source_chin + 0.45 × source_jaw_span
+    SOURCE_REAL_NECK_HALF_W_FRAC = 0.18  # 真实脖子半宽（两侧避开下颌阴影 / 衣领边缘）
+    SOURCE_NECK_MEAN_CUTOFF_FRAC = 0.50  # 在 source_chin + 0.50 × source_jaw_span 之下用脖子 mean 色填充
+
+    @classmethod
+    def _flatten_source_neck_below(cls, source_bgra: np.ndarray, source_face) -> np.ndarray:
+        """
+        把 source 图中「真实脖子区域之下」的所有内容替换为脖子 mean BGR。
+        这样后续 warp 时 polygon 下半段仍是脖子色，不会带进 T 恤 / 衣领等非肤色内容。
+        """
+        h, w = source_bgra.shape[:2]
+        lm = source_face.landmark
+        chin = cls._landmark_xy(lm[cls.LANDMARK_CHIN], w, h)
+        jl = cls._landmark_xy(lm[cls.LANDMARK_LEFT_JAW], w, h)
+        jr = cls._landmark_xy(lm[cls.LANDMARK_RIGHT_JAW], w, h)
+        jaw_span = float(np.hypot(jl[0] - jr[0], jl[1] - jr[1]))
+        if jaw_span < 12.0:
+            return source_bgra
+
+        # 真实脖子 ROI（取真实脖子核心区中位 BGR）
+        y_top = int(np.clip(chin[1] + jaw_span * cls.SOURCE_REAL_NECK_TOP_FRAC, 0, h))
+        y_bot = int(np.clip(chin[1] + jaw_span * cls.SOURCE_REAL_NECK_BOT_FRAC, 0, h))
+        half_w = int(jaw_span * cls.SOURCE_REAL_NECK_HALF_W_FRAC)
+        x_lo = int(np.clip(chin[0] - half_w, 0, w))
+        x_hi = int(np.clip(chin[0] + half_w, 0, w))
+        if y_bot <= y_top + 4 or x_hi <= x_lo + 4:
+            return source_bgra
+        roi = source_bgra[y_top:y_bot, x_lo:x_hi]
+        am = roi[:, :, 3] > 40
+        if not np.any(am):
+            return source_bgra
+        # 用 alpha>40 像素的 BGR 中位数作为脖子色
+        neck_mean = np.median(roi[:, :, :3][am], axis=0).astype(np.uint8)
+
+        # 在 chin + 0.50 × jaw_span 以下区域全部替换为脖子 mean BGR
+        out = source_bgra.copy()
+        cutoff_y = int(np.clip(chin[1] + jaw_span * cls.SOURCE_NECK_MEAN_CUTOFF_FRAC, 0, h))
+        if cutoff_y < h:
+            # 只动 BGR 通道，alpha 保持原样
+            out[cutoff_y:, :, 0] = int(neck_mean[0])
+            out[cutoff_y:, :, 1] = int(neck_mean[1])
+            out[cutoff_y:, :, 2] = int(neck_mean[2])
+        return out
+
     def _add_neck(
         self,
         head_bgra: np.ndarray,
@@ -126,13 +180,18 @@ class MakeIDPhoto:
     ) -> np.ndarray:
         """
         在头像下方加真实脖子：
+          0. 把 source 图中真实脖子之下的非肤色区域（T 恤 / 衣领等）替换为脖子 mean 色
+             —— 避免 warp 后把这些内容带到头像上
           1. 头像和原图各自检测的下颌三点构造 affine 变换
-          2. 把原图整体 warp 到头像坐标系
+          2. 把（处理过的）原图整体 warp 到头像坐标系
           3. 构造梯形脖子 polygon，在 polygon 内**用 warped 像素覆盖头像 BGR**
           4. polygon 内 alpha 强制满（与原 head alpha 取 max）
 
         polygon 边缘用 AA mask 0-255 灰度做软过渡，无可见接缝。
         """
+        # 0. 预处理 source：脖子之下用脖子 mean 色填充
+        source_bgra = self._flatten_source_neck_below(source_bgra, source_face)
+
         h, w = head_bgra.shape[:2]
         sH, sW = source_bgra.shape[:2]
 
@@ -310,7 +369,7 @@ class MakeIDPhoto:
         chin_y_in_canvas = head_paste_y + scaled_chin_y
 
         # 衣服 V 领位置：chin 下方 scaled_jaw × NECK_VISIBLE_TO_JAW_RATIO
-        neck_visible_h = int(round(scaled_jaw * self.NECK_VISIBLE_TO_JAW_RATIO))
+        neck_visible_h = int(round(scaled_jaw * self.neck_visible_ratio))
         target_vneck_y = chin_y_in_canvas + neck_visible_h
         target_vneck_x = canvas_w // 2
 
@@ -507,6 +566,11 @@ def main(argv: Optional[list] = None) -> int:
         "--bg", default=MakeIDPhoto.DEFAULT_BG_HEX,
         help=f"16 进制底色，默认 {MakeIDPhoto.DEFAULT_BG_HEX}（标准证件照蓝）",
     )
+    parser.add_argument(
+        "--neck-visible", type=float, default=None,
+        help=f"脖子可见高度 / scaled_jaw_span，默认 {MakeIDPhoto.NECK_VISIBLE_TO_JAW_RATIO}。"
+        "调大让脖子更长（如 1.20），调小更短（如 0.70）",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -516,6 +580,7 @@ def main(argv: Optional[list] = None) -> int:
             clothes_path=os.path.abspath(args.clothes),
             output_path=os.path.abspath(args.output),
             bg_hex=args.bg,
+            neck_visible_ratio=args.neck_visible,
         )
         return job.run()
     except Exception as e:
