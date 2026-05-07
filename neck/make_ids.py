@@ -33,6 +33,9 @@ class MakeIDPhoto:
     LANDMARK_CHIN = 152          # 下巴尖
     LANDMARK_LEFT_JAW = 172      # 左下颌角
     LANDMARK_RIGHT_JAW = 397     # 右下颌角
+    # 下颌弧线 landmark（mediapipe FACEMESH_FACE_OVAL 中下颌段）
+    # 顺序：左下颌角 → 下巴尖 → 右下颌角，13 个点描出真实下颌弧
+    JAW_ARC_LANDMARKS = (172, 136, 150, 149, 176, 148, 152, 377, 400, 378, 379, 365, 397)
 
     # ============ 脖子几何参数（经验值）============
     NECK_TOP_INSET = 0.95        # 脖子顶宽 / 下颌宽（接近 1 = 几乎=下颌宽）
@@ -410,10 +413,12 @@ class MakeIDPhoto:
     def _build_neck_polygon(self, landmarks, w: int, h: int) -> np.ndarray:
         """
         构造脖子梯形 polygon：
-          上沿：左下颌角 (172) → 下巴 (152) → 右下颌角 (397)，沿下颌弧线，
+          上沿：mediapipe 实际下颌弧线 landmark 13 点（自然 U 形下颌曲线，
+                而非 jl→chin→jr 三点直线插值的 V 形/倒三角），
                 整体上移 chin_overlap_px 让脖子顶部"陷"入下巴底
           下沿：上沿各点水平方向按 NECK_BOTTOM_FLARE 从中心外扩，
-                整体下移 jaw_span × NECK_DEPTH_FRAC
+                stretch 启用且 target>NECK_DEPTH_FRAC 时下沿延伸到
+                chin_y + neck_target_length × jaw_span，否则到 NECK_DEPTH_FRAC × jaw_span
 
         额外应用 NECK_TOP_INSET 让上沿整体内收（脖子接近下颌宽避免双下巴感）。
         返回 (N, 2) float64 像素坐标。
@@ -426,20 +431,12 @@ class MakeIDPhoto:
         if jaw_span < 12.0:
             raise RuntimeError("jaw_span 过小，可能未检测到完整人脸")
 
-        # 上沿用下颌弧线 5 个等距点（左→中→右），简化的 face oval 路径
-        # 实际位置取在三点之间线性插值，效果上是个光滑的下颌弧
-        n_top = 7
-        ts = np.linspace(0.0, 1.0, n_top)
+        # 上沿：直接用 mediapipe 真实下颌弧 13 个 landmark，构成自然 U 形曲线，
+        # 与脸下沿 alpha 边界自然贴合（不再是 jl→chin→jr 直线 V 形）
+        n_top = len(self.JAW_ARC_LANDMARKS)
         top_xy = np.zeros((n_top, 2), dtype=np.float64)
-        for i, t in enumerate(ts):
-            if t < 0.5:
-                tt = t / 0.5
-                top_xy[i, 0] = jl[0] + tt * (chin[0] - jl[0])
-                top_xy[i, 1] = jl[1] + tt * (chin[1] - jl[1])
-            else:
-                tt = (t - 0.5) / 0.5
-                top_xy[i, 0] = chin[0] + tt * (jr[0] - chin[0])
-                top_xy[i, 1] = chin[1] + tt * (jr[1] - chin[1])
+        for i, lid in enumerate(self.JAW_ARC_LANDMARKS):
+            top_xy[i, 0], top_xy[i, 1] = self._landmark_xy(lm[lid], w, h)
 
         # 上移 chin_overlap 把脖子顶部"陷"入下巴
         chin_overlap = jaw_span * self.CHIN_OVERLAP_FRAC
@@ -461,7 +458,7 @@ class MakeIDPhoto:
             bot_y = float(np.max(top_xy[:, 1])) + jaw_span * self.NECK_DEPTH_FRAC
         bottom_xy = np.column_stack([
             cx + (top_xy[:, 0] - cx) * self.NECK_BOTTOM_FLARE,
-            np.full(n_top, bot_y, dtype=np.float64),
+            np.full(top_xy.shape[0], bot_y, dtype=np.float64),
         ])
 
         # 闭环：上沿左→右 + 下沿右→左
