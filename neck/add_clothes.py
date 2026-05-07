@@ -52,20 +52,24 @@ except ImportError:
 # 标准证件照背景色（中国大陆居民身份证 / 证件照常见蓝色 BGR）。
 # 注意 OpenCV 是 BGR 顺序：标准证件照蓝 ≈ R=67, G=142, B=219
 ID_PHOTO_BLUE_BGR: Tuple[int, int, int] = (219, 142, 67)
-# 输出尺寸（W×H）。常见证件照比例 295×413 (1 英寸放大 4 倍 = 实际 295×413 px @ 300 DPI)。
-DEFAULT_OUTPUT_SIZE_WH: Tuple[int, int] = (590, 826)
-# 头像顶端到画布顶端的 margin 比例（头顶之上留多少空间）
-HEAD_TOP_MARGIN_FRAC: float = 0.06
-# 头部高度占画布高度的目标比例（头顶到下巴）
-HEAD_HEIGHT_FRAC: float = 0.50
-# 衣服 V 领顶点相对 chin 下方的位置 = chin_y + jaw_span × CLOTHES_VNECK_ANCHOR_FRAC
-# 0.30 让 V 领紧贴 chin 下方，避开脖子 fade-out 区，无视觉缝隙
-CLOTHES_VNECK_ANCHOR_FRAC: float = 0.30
-# 衣服宽度相对 jaw_span 的比例
-CLOTHES_WIDTH_TO_JAW_RATIO: float = 5.5
-# 衣服顶部 V 领顶点的 x 坐标在衣服图中的位置（默认假定居中）
+
+# === 新版几何定位策略：以衣服模板为基准，不缩放衣服 ===
+# canvas 宽度 = 衣服模板原始宽度（保留衣服细节，避免缩放损失）
+# canvas 高度 = 头顶 margin + 头部 + 脖子 + 衣服（自动推导）
+
+# (a) 头部 jaw_span 在 canvas 中的目标宽度 = clothes_w × 此比例
+#     1 寸证件照里下颌宽通常占画面宽度的 17-22%；取 0.20。
+HEAD_JAW_SPAN_TO_CANVAS_W_RATIO: float = 0.20
+# (b) 头顶到 canvas 顶端 margin = clothes_w × 此比例
+#     头顶留白通常 ~10-12% 画布宽度。
+HEAD_TOP_MARGIN_TO_CANVAS_W_RATIO: float = 0.11
+# (c) 脖子可见高度（chin 到 V 领顶点的经验距离）= scaled_jaw_span × 此比例
+#     经验值：脖子在证件照里露出 0.70 × jaw_span 高度后被衣领遮住，比例自然。
+#     注意：此值是 scaled_jaw_span 的倍数（与头部缩放联动），不是绝对像素。
+NECK_VISIBLE_TO_JAW_SPAN_RATIO: float = 0.70
+
+# 衣服顶部 V 领顶点的 fallback 位置（自动检测失败时用）
 CLOTHES_TEMPLATE_VNECK_X_FRAC: float = 0.50
-# V 领顶点的 y 坐标在衣服图中的位置（多数模板顶点在最上方一带，取顶部 5% 处的 alpha 中心）
 CLOTHES_TEMPLATE_VNECK_Y_FRAC: float = 0.18
 # 头部检测+延长脖子的临时 PNG（中间产物）
 TEMP_HEAD_WITH_NECK_NAME: str = "_tmp_head_with_neck.png"
@@ -74,6 +78,35 @@ TEMP_HEAD_WITH_NECK_NAME: str = "_tmp_head_with_neck.png"
 # =====================================================================================
 # 主函数
 # =====================================================================================
+
+
+# 调用 add_fake_neck_v1 前，确保 chin 下方有足够空间画脖子。
+# add_neckv1 的脖子 polygon 高度 = jaw_span × JAW_SPAN_DEPTH_FRAC × slim ≈ jaw_span × 1.4 × 0.87 ≈ 1.22。
+# 留 1.5x 余量。
+NECK_DRAWING_BOTTOM_PAD_FACTOR: float = 1.5
+
+
+def _ensure_neck_drawing_space(bgra: np.ndarray) -> Tuple[np.ndarray, int]:
+    """
+    若 chin 下方在画布内剩余像素 < jaw_span × NECK_DRAWING_BOTTOM_PAD_FACTOR，
+    在画布底部加透明 padding，让 add_fake_neck_v1 有足够空间绘制脖子。
+
+    返回 (扩展后 bgra, 加了多少 px 的底部 pad)。
+    """
+    detected = _detect_chin_and_jaw_span(bgra)
+    if detected is None:
+        return bgra, 0
+    chin_x, chin_y, jaw_span = detected
+    h, w = bgra.shape[:2]
+    needed = int(round(jaw_span * NECK_DRAWING_BOTTOM_PAD_FACTOR))
+    available = h - int(chin_y)
+    if available >= needed:
+        return bgra, 0
+    pad = needed - available
+    out = np.zeros((h + pad, w, 4), dtype=np.uint8)
+    out[:h, :, :] = bgra
+    # 底部 padding 区 alpha=0（透明），不会影响合成
+    return out, pad
 
 
 def _detect_chin_and_jaw_span(bgra: np.ndarray) -> Optional[Tuple[float, float, float]]:
@@ -188,27 +221,29 @@ def add_clothes(
     output_path: str,
     source_image_path: Optional[str] = None,
     bg_color_bgr: Tuple[int, int, int] = ID_PHOTO_BLUE_BGR,
-    output_size_wh: Tuple[int, int] = DEFAULT_OUTPUT_SIZE_WH,
-    head_top_margin_frac: float = HEAD_TOP_MARGIN_FRAC,
-    head_height_frac: float = HEAD_HEIGHT_FRAC,
-    clothes_vneck_anchor_frac: float = CLOTHES_VNECK_ANCHOR_FRAC,
-    clothes_width_to_jaw_ratio: float = CLOTHES_WIDTH_TO_JAW_RATIO,
+    head_jaw_to_canvas_ratio: float = HEAD_JAW_SPAN_TO_CANVAS_W_RATIO,
+    head_top_margin_to_canvas_ratio: float = HEAD_TOP_MARGIN_TO_CANVAS_W_RATIO,
+    neck_visible_to_jaw_ratio: float = NECK_VISIBLE_TO_JAW_SPAN_RATIO,
     keep_temp_files: bool = False,
 ) -> int:
     """
     用抠图头像 + 原图 + 衣服模板合成蓝底证件照。
 
+    **几何定位策略**（以衣服模板为基准 + 经验值像素定位）：
+      - canvas 宽度 = 衣服模板原始宽度（衣服不缩放，保留细节）
+      - canvas 高度 = 自动推导 = 头顶 margin + 头部高 + 脖子可见 + 衣服尚下部分
+      - 头部缩放比例：让 scaled_jaw_span = canvas_w × ``head_jaw_to_canvas_ratio``
+      - 脖子可见高度：scaled_jaw_span × ``neck_visible_to_jaw_ratio``
+      - 衣服 V 领顶点位置 = chin_y_in_canvas + 脖子可见高度（让脖子从衣领里露出来）
+
     :param head_image_path: 抠图好的头像路径（RGBA 透明背景）
-    :param clothes_template_path: 衣服模板路径（RGBA 衣服图，背景透明）
+    :param clothes_template_path: 衣服模板路径（RGBA 衣服图，**不缩放**）
     :param output_path: 输出蓝底证件照路径
-    :param source_image_path: 同人完整原图路径（用于 add_fake_neck_v1 transplant 模式
-        1:1 复刻真实脖子色彩）；为 None 走 add_fake_neck_v1 的 fallback 合成路径。
-    :param bg_color_bgr: 背景色（默认证件照蓝）
-    :param output_size_wh: 输出图尺寸 (宽, 高)，默认 590×826（证件照 5:7 比例）
-    :param head_top_margin_frac: 头顶到画布顶端 margin / 画布高
-    :param head_height_frac: 头部（头顶到下巴）高度 / 画布高
-    :param clothes_vneck_anchor_frac: 衣服 V 领顶点相对 chin 的纵向偏移（jaw_span 倍数）
-    :param clothes_width_to_jaw_ratio: 衣服整体宽度 / jaw_span
+    :param source_image_path: 同人完整原图路径（用于 transplant 1:1 真实脖子色彩）
+    :param bg_color_bgr: 背景色（默认证件照蓝 BGR=(219,142,67)）
+    :param head_jaw_to_canvas_ratio: jaw_span / canvas_w，默认 0.20（脸宽约 1/5 画布）
+    :param head_top_margin_to_canvas_ratio: 头顶 margin / canvas_w，默认 0.11
+    :param neck_visible_to_jaw_ratio: 脖子可见高度 / scaled_jaw_span，默认 0.70
     :param keep_temp_files: 是否保留中间产物（带脖子的头像 PNG）
     :return: 0 成功, 非零失败
     """
@@ -223,9 +258,15 @@ def add_clothes(
         print(f"[错误] 头像中未检测到人脸: {head_image_path}", file=sys.stderr)
         return 1
 
+    # ★ 关键：image0 等抠图常常画布卡到 chin（chin 离底部仅 0-5px），
+    # 加脖子前必须先扩展底部画布，否则 polygon 没空间画。
+    head_bgra_expanded, pad_added = _ensure_neck_drawing_space(head_bgra)
+    if pad_added > 0:
+        print(f"[信息] 原画布 chin 下空间不足，已在底部加 {pad_added}px 透明 padding")
+
     try:
         head_with_neck, _skin_marked = add_fake_neck_v1(
-            head_bgra,
+            head_bgra_expanded,
             source_image_path=source_image_path,
         )
     except Exception as e:
@@ -235,46 +276,20 @@ def add_clothes(
     if keep_temp_files:
         imwrite_unicode(tmp_head_path, head_with_neck)
 
-    # 重新检测 chin / jaw_span（脖子加完后位置不变，但用最新的 BGRA 做后续合成）
+    # 重新检测脖子图上的 chin / jaw_span（用于位置对齐）
     detected2 = _detect_chin_and_jaw_span(head_with_neck)
     if detected2 is None:
-        print("[错误] 加完脖子后人脸检测失败（这通常不会发生）", file=sys.stderr)
+        print("[错误] 加完脖子后人脸检测失败", file=sys.stderr)
         return 1
     chin_x, chin_y, jaw_span = detected2
 
-    # ============ 2. 计算头像在输出 canvas 中的目标位置和缩放 ============
-    out_w, out_h = int(output_size_wh[0]), int(output_size_wh[1])
     head_bbox = _compute_head_bbox(head_with_neck)
     if head_bbox is None:
         print("[错误] 无法获取头像 bbox", file=sys.stderr)
         return 1
-    bx0, by0, bx1, by1 = head_bbox
-    src_head_h = by1 - by0  # 头像 alpha bbox 高度（含脖子）
+    bx0, by0, bx1, by1 = head_bbox  # by0 = 头顶 y
 
-    # 注意：bbox 含整个 alpha 范围（脸 + 脖子）。我们想"头部高度" = 头顶到 chin = chin_y - by0。
-    head_top_to_chin = max(int(chin_y) - by0, 1)
-    target_head_top_to_chin = int(out_h * head_height_frac)
-    scale = target_head_top_to_chin / float(head_top_to_chin)
-
-    # 缩放整个 head_with_neck（保持原比例）
-    src_h, src_w = head_with_neck.shape[:2]
-    scaled_w = max(1, int(round(src_w * scale)))
-    scaled_h = max(1, int(round(src_h * scale)))
-    scaled_head = _resize_with_alpha(head_with_neck, scaled_w, scaled_h)
-
-    # 缩放后的几何
-    scaled_chin_x = int(round(chin_x * scale))
-    scaled_chin_y = int(round(chin_y * scale))
-    scaled_jaw_span = jaw_span * scale
-    scaled_bx0 = int(round(bx0 * scale))
-    scaled_by0 = int(round(by0 * scale))
-
-    # 头像在 canvas 中的放置位置：让 by0 (头顶) 距 canvas 顶端 = head_top_margin_frac × out_h
-    paste_y = int(out_h * head_top_margin_frac) - scaled_by0
-    # 水平居中：让 chin_x 落在 canvas 中央
-    paste_x = (out_w // 2) - scaled_chin_x
-
-    # ============ 3. 衣服模板缩放 + 对齐 V 领顶点到 chin 下方 ============
+    # ============ 2. 加载衣服模板（不缩放）+ 自动检测 V 领锚点 ============
     clothes_bgra = imread_unicode(clothes_template_path, cv2.IMREAD_UNCHANGED)
     if clothes_bgra is None or clothes_bgra.ndim != 3:
         print(f"[错误] 衣服模板加载失败: {clothes_template_path}", file=sys.stderr)
@@ -282,49 +297,78 @@ def add_clothes(
     if clothes_bgra.shape[2] == 3:
         clothes_bgra = cv2.cvtColor(clothes_bgra, cv2.COLOR_BGR2BGRA)
         clothes_bgra[:, :, 3] = 255
+    elif clothes_bgra.shape[2] != 4:
+        print(f"[错误] 衣服模板格式不支持: shape={clothes_bgra.shape}", file=sys.stderr)
+        return 1
 
-    # 自动找衣服模板的 V 领锚点
-    cl_anchor_x, cl_anchor_y = _find_clothes_vneck_anchor(clothes_bgra)
     cl_h, cl_w = clothes_bgra.shape[:2]
+    cl_anchor_x, cl_anchor_y = _find_clothes_vneck_anchor(clothes_bgra)
 
-    # 衣服目标宽度 = scaled_jaw_span × ratio
-    target_clothes_w = scaled_jaw_span * clothes_width_to_jaw_ratio
-    cl_scale = target_clothes_w / float(cl_w)
-    cl_new_w = max(1, int(round(cl_w * cl_scale)))
-    cl_new_h = max(1, int(round(cl_h * cl_scale)))
-    scaled_clothes = _resize_with_alpha(clothes_bgra, cl_new_w, cl_new_h)
-    scaled_anchor_x = int(round(cl_anchor_x * cl_scale))
-    scaled_anchor_y = int(round(cl_anchor_y * cl_scale))
+    # ============ 3. 几何定位（按经验值）============
+    canvas_w = cl_w  # canvas 宽度 = 衣服宽度
 
-    # V 领顶点应对齐到（在 canvas 坐标系下）：
-    #   ax = canvas 中央
-    #   ay = canvas 中 chin_y 位置 + scaled_jaw_span × clothes_vneck_anchor_frac
-    canvas_chin_y = paste_y + scaled_chin_y
-    target_anchor_x_canvas = out_w // 2
-    target_anchor_y_canvas = int(round(canvas_chin_y + scaled_jaw_span * clothes_vneck_anchor_frac))
+    # 头部缩放：让 scaled_jaw_span = canvas_w × ratio
+    target_jaw_span_in_canvas = canvas_w * head_jaw_to_canvas_ratio
+    scale = target_jaw_span_in_canvas / float(jaw_span)
 
-    # 衣服图层在 canvas 中的左上角放置坐标
-    clothes_paste_x = target_anchor_x_canvas - scaled_anchor_x
-    clothes_paste_y = target_anchor_y_canvas - scaled_anchor_y
+    src_h, src_w = head_with_neck.shape[:2]
+    scaled_w = max(1, int(round(src_w * scale)))
+    scaled_h = max(1, int(round(src_h * scale)))
+    scaled_head = _resize_with_alpha(head_with_neck, scaled_w, scaled_h)
+    scaled_chin_x = int(round(chin_x * scale))
+    scaled_chin_y = int(round(chin_y * scale))
+    scaled_by0 = int(round(by0 * scale))  # 头顶 y in scaled_head
+    scaled_jaw_span = jaw_span * scale     # = target_jaw_span_in_canvas
+
+    # 头顶距 canvas 顶端 margin（经验像素值）
+    head_top_margin_px = int(round(canvas_w * head_top_margin_to_canvas_ratio))
+
+    # head 在 canvas 中的位置
+    head_paste_y = head_top_margin_px - scaled_by0
+    head_paste_x = canvas_w // 2 - scaled_chin_x
+
+    # chin 在 canvas 中的 y 位置
+    chin_y_in_canvas = head_paste_y + scaled_chin_y
+
+    # 脖子可见高度（chin 到 V 领顶点的距离，经验值）
+    neck_visible_h = int(round(scaled_jaw_span * neck_visible_to_jaw_ratio))
+
+    # V 领顶点在 canvas 中的目标位置：chin_y + 脖子可见高度
+    target_vneck_y_in_canvas = chin_y_in_canvas + neck_visible_h
+    target_vneck_x_in_canvas = canvas_w // 2  # 衣服 V 领居中
+
+    # 衣服在 canvas 中的左上角放置位置
+    clothes_paste_x = target_vneck_x_in_canvas - cl_anchor_x
+    clothes_paste_y = target_vneck_y_in_canvas - cl_anchor_y
+
+    # canvas 高度 = 衣服底部位置（衣服贴底）
+    clothes_bottom_y = clothes_paste_y + cl_h
+    canvas_h = max(clothes_bottom_y, target_vneck_y_in_canvas + 10)
 
     # ============ 4. 合成 ============
     bg_b, bg_g, bg_r = bg_color_bgr
-    canvas = np.zeros((out_h, out_w, 4), dtype=np.uint8)
+    canvas = np.zeros((canvas_h, canvas_w, 4), dtype=np.uint8)
     canvas[:, :, 0] = bg_b
     canvas[:, :, 1] = bg_g
     canvas[:, :, 2] = bg_r
     canvas[:, :, 3] = 255
 
     # 顺序：bg ← clothes ← head（最上层）
-    canvas = _alpha_paste(canvas, scaled_clothes, clothes_paste_x, clothes_paste_y)
-    canvas = _alpha_paste(canvas, scaled_head, paste_x, paste_y)
+    canvas = _alpha_paste(canvas, clothes_bgra, clothes_paste_x, clothes_paste_y)
+    canvas = _alpha_paste(canvas, scaled_head, head_paste_x, head_paste_y)
 
     # ============ 5. 输出 ============
     if not imwrite_unicode(output_path, canvas):
         print(f"[错误] 写入输出失败: {output_path}", file=sys.stderr)
         return 1
 
-    print(f"已保存: {output_path}")
+    print(f"已保存: {output_path}  (canvas {canvas_w}x{canvas_h})")
+    print(
+        f"  几何: scaled_jaw_span={scaled_jaw_span:.0f}px, "
+        f"head_top_margin={head_top_margin_px}px, "
+        f"neck_visible={neck_visible_h}px, "
+        f"vneck_at=({target_vneck_x_in_canvas},{target_vneck_y_in_canvas})"
+    )
     if keep_temp_files:
         print(f"中间产物（带脖子头像）: {tmp_head_path}")
     elif os.path.exists(tmp_head_path):
@@ -356,24 +400,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="背景色 BGR（逗号分隔），默认 219,142,67（标准证件照蓝）",
     )
     parser.add_argument(
-        "--size", default=f"{DEFAULT_OUTPUT_SIZE_WH[0]}x{DEFAULT_OUTPUT_SIZE_WH[1]}",
-        help="输出尺寸 WxH，默认 590x826（5:7 证件照比例）",
+        "--head-jaw-ratio", type=float, default=HEAD_JAW_SPAN_TO_CANVAS_W_RATIO,
+        help="头部 jaw_span / canvas_w 比例，默认 0.20（脸宽约 1/5 画布）。"
+        "调大 → 头部更大；调小 → 头部更小",
     )
     parser.add_argument(
-        "--head-top-margin", type=float, default=HEAD_TOP_MARGIN_FRAC,
-        help="头顶到画布顶端 margin 占画布高的比例，默认 0.06",
+        "--head-top-margin", type=float, default=HEAD_TOP_MARGIN_TO_CANVAS_W_RATIO,
+        help="头顶到 canvas 顶 margin / canvas_w 比例，默认 0.11",
     )
     parser.add_argument(
-        "--head-height-frac", type=float, default=HEAD_HEIGHT_FRAC,
-        help="头部（头顶到下巴）高度占画布高的比例，默认 0.50",
-    )
-    parser.add_argument(
-        "--clothes-anchor-frac", type=float, default=CLOTHES_VNECK_ANCHOR_FRAC,
-        help="衣服 V 领顶点对齐到 chin 下方的距离（jaw_span 倍数），默认 0.30",
-    )
-    parser.add_argument(
-        "--clothes-width-ratio", type=float, default=CLOTHES_WIDTH_TO_JAW_RATIO,
-        help="衣服宽度 / jaw_span 比例，默认 5.5",
+        "--neck-visible-ratio", type=float, default=NECK_VISIBLE_TO_JAW_SPAN_RATIO,
+        help="脖子可见高度 / scaled_jaw_span 比例，默认 0.70。"
+        "调大 → 脖子更长（V 领更远）；调小 → V 领更近 chin",
     )
     parser.add_argument(
         "--keep-temp", action="store_true",
@@ -387,23 +425,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     bg_color = tuple(int(np.clip(v, 0, 255)) for v in bg_parts)  # type: ignore
 
-    size_parts = args.size.lower().split("x")
-    if len(size_parts) != 2:
-        print("[错误] --size 必须是 WxH（如 590x826）", file=sys.stderr)
-        return 1
-    out_size = (int(size_parts[0]), int(size_parts[1]))
-
     return add_clothes(
         head_image_path=os.path.abspath(args.head),
         clothes_template_path=os.path.abspath(args.clothes),
         output_path=os.path.abspath(args.output),
         source_image_path=os.path.abspath(args.source) if args.source else None,
         bg_color_bgr=bg_color,  # type: ignore
-        output_size_wh=out_size,
-        head_top_margin_frac=args.head_top_margin,
-        head_height_frac=args.head_height_frac,
-        clothes_vneck_anchor_frac=args.clothes_anchor_frac,
-        clothes_width_to_jaw_ratio=args.clothes_width_ratio,
+        head_jaw_to_canvas_ratio=args.head_jaw_ratio,
+        head_top_margin_to_canvas_ratio=args.head_top_margin,
+        neck_visible_to_jaw_ratio=args.neck_visible_ratio,
         keep_temp_files=args.keep_temp,
     )
 
