@@ -51,6 +51,7 @@ try:
         NECK_HUE_SHIFT_DEFAULT, NECK_SAT_SCALE_DEFAULT, odd_kernel,
         estimate_existing_neck_extent_px, COLLAR_DETECT_MIN_FRAC, COLLAR_DEPTH_SHRINK_MIN_PX,
         detect_face_with_retry, _detect_first_face, alpha_over, render_skin_sample_marked_preview,
+        generate_pink_noise_2d, GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX,
     )
 except ImportError:  # 直接 `python add_neckv1.py` 时 cwd 是 neck/，无 neck 包
     from add_neck import (  # type: ignore
@@ -69,6 +70,7 @@ except ImportError:  # 直接 `python add_neckv1.py` 时 cwd 是 neck/，无 nec
         NECK_HUE_SHIFT_DEFAULT, NECK_SAT_SCALE_DEFAULT, odd_kernel,
         estimate_existing_neck_extent_px, COLLAR_DETECT_MIN_FRAC, COLLAR_DEPTH_SHRINK_MIN_PX,
         detect_face_with_retry, _detect_first_face, alpha_over, render_skin_sample_marked_preview,
+        generate_pink_noise_2d, GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX,
     )
 
 
@@ -80,10 +82,13 @@ except ImportError:  # 直接 `python add_neckv1.py` 时 cwd 是 neck/，无 nec
 # 出来普遍偏亮偏粉。改为只用下颌附近的 4 个点：下巴上 / 下巴尖 / 双下颌角，
 # 完全忽略脸颊、额头、人中。
 NECK_ANCHOR_LANDMARKS: Tuple[Tuple[int, float, str, int], ...] = (
-    (200, 0.30, "above-chin", 12),
-    (152, 0.30, "chin-tip",   12),
-    (172, 0.20, "L-jaw",      12),
-    (397, 0.20, "R-jaw",      12),
+    # 实测 imagev2 脖子色 ≈ 双颊色而非下颌色（AI 生成倾向脖子与脸主体一致）。
+    # 把权重重平衡到「双颊主导 + 下巴辅助」，颌角去掉（颌角通常偏暗有阴影）。
+    (205, 0.32, "L-cheek",    14),
+    (425, 0.32, "R-cheek",    14),
+    (164, 0.16, "philtrum",   12),
+    (200, 0.10, "above-chin", 12),
+    (152, 0.10, "chin-tip",   10),
 )
 
 
@@ -132,6 +137,39 @@ def sample_neck_anchor_skin_color(
     return _apply_neck_skin_tone(raw, skin_v_scale, skin_h_shift, skin_s_scale)
 
 
+# Reinhard tone-match 的 ref pool 用「双颊主导 + 人中」，**不含下巴**（下巴常处于阴影会
+# 拉低 ref mean）。让 ref mean 尽量接近脸主体亮度，从而脖子色匹配真正的脸色而非下颌阴影色。
+NECK_REF_POOL_LANDMARKS: Tuple[int, ...] = (205, 425, 50, 280, 164)  # L 颊/R 颊/L 颊上/R 颊上/人中
+
+
+def _gather_neck_ref_pixels(
+    bgra: np.ndarray,
+    landmarks,
+    h: int,
+    w: int,
+    patch: int = 24,
+) -> np.ndarray:
+    """
+    收集「脖子色应当对齐」的参考像素池：颊主导 + 人中，不含下巴/下颌角。
+    每块 patch×patch ROI 内取 alpha>40 ∩ YCrCb 肤色的像素。
+    """
+    lm = landmarks.landmark
+    chunks: List[np.ndarray] = []
+    for lid in NECK_REF_POOL_LANDMARKS:
+        cx, cy = landmark_xy(lm[lid], w, h)
+        x0, y0, pw, ph = skin_patch_rect_at(cx, cy, h, w, patch)
+        if pw <= 0 or ph <= 0:
+            continue
+        roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
+        am, sm = _patch_skin_alpha_mask(roi)
+        use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
+        if np.any(use):
+            chunks.append(roi[:, :, :3][use])
+    if not chunks:
+        return np.empty((0, 3), dtype=np.uint8)
+    return np.vstack(chunks)
+
+
 # =====================================================================================
 # Phase B: Image Quilting （从脸部真实皮肤拼接到脖子区域）
 # =====================================================================================
@@ -154,19 +192,48 @@ QUILT_LIBRARY_SAMPLE_BOX_FRAC = 3.0
 QUILT_MIN_SKIN_RATIO = 0.80
 QUILT_RNG_SEED = 12345
 
-# --- 新默认方案：Face Detail Tiling（取脸单块肤色 ROI 镜像平铺，无接缝） --------------
-# 在低频皮肤区域，min-cut seam 反而会暴露可见接缝；改用「取一块够大的连续肤色 ROI，
-# BORDER_REFLECT 镜像平铺到脖子区域」的方案，绝对无接缝。然后通过 mean-match 抽其
-# 高频 detail 叠加到 procedural 上，纹理与光影分离。
-DETAIL_TILE_SIZE_FRAC = 0.45              # tile 边长 ≈ jaw_span * 0.45
-DETAIL_TILE_MIN_PX = 36
-DETAIL_TILE_MAX_PX = 220
-DETAIL_TILE_LANDMARKS = (205, 425, 10)    # 左颊 / 右颊 / 额中：依次尝试取最大连续肤色 ROI
-DETAIL_INTENSITY_CLIP = 12.0              # |detail| 限制（防 quilt 残留色斑）
+# --- 新默认方案：1/f Pink Noise Detail（频谱接近皮肤毛孔，无脸结构污染）-------------
+# face_detail_tile 取脸颊 ROI 镜像平铺会把脸上的眼角/鼻翼阴影等大结构也带进 detail，
+# 在脖子上显出"漏斗形阴影"。改用 1/f pink noise 做 detail：频谱与真实皮肤毛孔接近
+# 但是纯合成纹理，**完全没有脸的结构污染**。强度参考 imagev2 实测 std≈11.7。
+PINK_NOISE_SIGMA = 8.0                    # 8 ≈ 真实皮肤 luminance 微变化幅度
+PINK_NOISE_ALPHA = 0.5                    # 1/f^0.5（接近白噪声但稍偏低频，更接近真实皮肤）
+PINK_NOISE_BLUR_SIGMA = 1.2               # blur 1.2px 让噪点显细腻（不显砂砾）
+
+# --- Face Detail Tiling（旧路径，保留作可选）-----------------------------------------
+DETAIL_TILE_SIZE_FRAC = 0.20              # 0.45→0.20：更小 tile 减少非纹理结构混入
+DETAIL_TILE_MIN_PX = 24
+DETAIL_TILE_MAX_PX = 80
+DETAIL_TILE_LANDMARKS = (205, 425, 10)
+DETAIL_INTENSITY_CLIP = 18.0
+DETAIL_EDGE_FEATHER_PX = 8
 
 # Mean-Match σ 必须 **远大于** detail tile 大小才能消除 tile 级色彩漂移；
 # 实测 σ ≥ tile_size 即可干净消除任何 tile 级低频差异。
 QUILT_MEAN_MATCH_SIGMA_FRAC = 4.0
+
+
+def _masked_gaussian_blur(
+    img: np.ndarray, mask_f: np.ndarray, sigma: float, ksize: int
+) -> np.ndarray:
+    """
+    Mask-aware Gaussian blur：只考虑 mask 内像素的卷积。返回 (h,w,3) float32。
+    img_blur(p) = sum(img(q)*mask(q)*g(p,q)) / sum(mask(q)*g(p,q))
+    避免 mask 外 0 值让 mask 边缘的 lf 偏低（以及 detail 假性偏高）。
+    """
+    img_f = img.astype(np.float32)
+    if img_f.ndim == 2:
+        img_f = img_f[..., None]
+    mw_2d = mask_f if mask_f.ndim == 2 else mask_f[..., 0]
+    mw_2d = mw_2d.astype(np.float32)
+    mw = mw_2d[..., None]
+    weighted_img = img_f * mw
+    blur_img = cv2.GaussianBlur(weighted_img, (ksize, ksize), sigma)
+    # 注意 OpenCV 对 (h,w,1) 输入可能返回 (h,w)，统一转 (h,w,1)
+    blur_w_2d = cv2.GaussianBlur(mw_2d, (ksize, ksize), sigma)
+    blur_w = np.maximum(blur_w_2d, 1e-3)[..., None]
+    out = blur_img / blur_w
+    return out
 
 
 def build_face_skin_patch_library(
@@ -884,17 +951,15 @@ def procedural_neck_init(
     R_est = max(span_x * 0.5, 4.0)
     light = estimate_face_lighting_for_neck(bgra, landmarks, h, w, R_est)
     if flat_shading:
-        # 平 shading：完全跳过 neck_cylinder_shade_map（它内部硬编码画 SCM 阴影 + 中轴凸起，
-        # 即便 k_lit/k_shadow=0 也会画，对 portrait 显假）。自己写最小颌下 AO：仅根据到上沿
-        # 折线的距离做指数衰减，越近脖子顶端越暗 ~3%。
+        # 平 shading：跳过 cylinder（避免 SCM/ridge），自己写颌下 AO + 自顶到底渐变。
+        # imagev2 实测脖子顶部（chin+15%）比中段（chin+50%）暗约 5%，所以 AO 最多 -8%。
         n_up_pre = max(poly.shape[0] // 2, 2)
         upper_pre = poly[:n_up_pre].astype(np.float64)
         dt_top = distance_map_to_polyline(h, w, upper_pre)
         depth_for_ao = max(float(np.max(poly[:, 1]) - np.min(poly[:, 1])), 1.0)
-        tau_ao = max(depth_for_ao * 0.18, 6.0)
+        tau_ao = max(depth_for_ao * 0.22, 8.0)
         ao_w = np.exp(-dt_top / tau_ao)
-        L = 1.0 - 0.03 * ao_w  # 颌下最多压 3%
-        # 限制只在 mask 内有效；mask 外 L=1
+        L = 1.0 - 0.08 * ao_w  # 颌下最多压 8%（之前 3% 太弱）
         wm_f = (mask >= 1).astype(np.float64)
         L = L * wm_f + (1.0 - wm_f)
     else:
@@ -976,9 +1041,31 @@ def realism_pipeline(
     overlap = max(int(round(patch_size * QUILT_OVERLAP_FRAC)), 4)
     library: List[np.ndarray] = []
     library_size = 0
+    detail = np.zeros((h, w, 3), dtype=np.float32)
+    edge_dist = cv2.distanceTransform(
+        mask_bool.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+    )
+    edge_weight = np.clip(edge_dist / float(DETAIL_EDGE_FEATHER_PX), 0.0, 1.0)
     if enable_quilt:
         rng = np.random.default_rng(rng_seed)
-        if quilt_method == "tile":
+        if quilt_method == "noise":
+            # 1/f pink noise 频谱接近真实皮肤毛孔。
+            # 关键：3 通道共享同一**灰度** noise（不是各自独立 RGB noise，否则产生彩虹色斑）。
+            # 真实皮肤纹理本质是 luminance 变化（毛孔深浅 / 皮下血管），各 RGB 通道同步变。
+            sigma = float(np.clip(PINK_NOISE_SIGMA, 1.0, 60.0))
+            noise_gray = generate_pink_noise_2d(h, w, sigma, alpha=PINK_NOISE_ALPHA, seed=rng_seed)
+            if PINK_NOISE_BLUR_SIGMA > 0:
+                bk = odd_kernel(int(round(PINK_NOISE_BLUR_SIGMA * 3.0)) + 1)
+                noise_gray = cv2.GaussianBlur(noise_gray, (bk, bk), PINK_NOISE_BLUR_SIGMA)
+            # 3 通道共享，但允许 R/G/B 各通道有微小色相波动（×0.95~1.05 让它不完全单调）
+            noise = np.stack([
+                noise_gray * 0.95,
+                noise_gray * 1.00,
+                noise_gray * 1.05,
+            ], axis=-1).astype(np.float32)
+            detail = noise * edge_weight[..., None] * mask_bool[..., None].astype(np.float32)
+            have_texture = True
+        elif quilt_method == "tile":
             quilted = face_detail_tile_into_mask(
                 bgra, landmarks, h, w, mask_bool, jaw_span, rng=rng,
             )
@@ -992,34 +1079,27 @@ def realism_pipeline(
                 )
                 have_texture = True
 
-    # ---------- Mean-Match Texture Transfer：消除任何残留低频差异的关键 ---------------
-    # detail = quilted - quilted_lf；σ 取 max(tile_size, patch_size) * 4。
-    # 然后 detail 限幅 ±DETAIL_INTENSITY_CLIP，最后加到 procedural 上。
-    if have_texture:
+    # ---------- Mean-Match Texture Transfer（仅 tile/patchquilt 路径需要）-------------
+    # 1/f pink noise 路径已经天然 high-pass（频谱在低频较弱），不需要 mean-match。
+    if have_texture and quilt_method in ("tile", "patchquilt"):
         if quilt_method == "tile":
             tile_size_eff = int(np.clip(round(jaw_span * DETAIL_TILE_SIZE_FRAC), DETAIL_TILE_MIN_PX, DETAIL_TILE_MAX_PX))
         else:
             tile_size_eff = patch_size
         sigma_match = max(tile_size_eff * QUILT_MEAN_MATCH_SIGMA_FRAC, 12.0)
         k_match = odd_kernel(int(round(sigma_match * 3.0)) + 1)
-        quilted_lf = cv2.GaussianBlur(quilted.astype(np.float32), (k_match, k_match), sigma_match)
+        mask_f = mask_bool.astype(np.float32)
+        quilted_lf = _masked_gaussian_blur(quilted, mask_f, sigma_match, k_match)
         detail = quilted.astype(np.float32) - quilted_lf
-        # 限幅：避免极端 detail 把 patch boundary 显化
         detail = np.clip(detail, -DETAIL_INTENSITY_CLIP, DETAIL_INTENSITY_CLIP)
-        # 只在 mask 内贡献 detail
-        detail = detail * mask_bool[..., None].astype(np.float32)
-    else:
-        detail = np.zeros((h, w, 3), dtype=np.float32)
+        detail = detail * edge_weight[..., None] * mask_bool[..., None].astype(np.float32)
 
     # ---------- Phase D: 把 detail（高频纹理）叠加到 procedural ----------------------
-    # 用 Laplacian 金字塔 alpha 调制：高频段 detail 全权写入，低频段几乎不写入。
     if enable_lap_blend and have_texture:
-        # 简化：直接 procedural + detail（detail 已经是 high-pass，等价于只贡献高频）
         blended_bgr = np.clip(
             procedural_layer[:, :, :3].astype(np.float32) + detail, 0, 255
         ).astype(np.uint8)
     elif have_texture and not enable_lap_blend:
-        # 完全用 quilted 替换 procedural（不推荐）
         blended_bgr = quilted.copy()
     else:
         blended_bgr = procedural_layer[:, :, :3].copy()
@@ -1033,16 +1113,15 @@ def realism_pipeline(
         k = odd_kernel(int(round(sigma * 3.0)) + 1)
         refined_alpha = (cv2.GaussianBlur(polygon_mask_u8.astype(np.float32), (k, k), sigma) / 255.0).astype(np.float64)
 
-    # ---------- Phase E: Pitié 颜色迁移 ----------------------------------------------
-    # 重要：用 refined_alpha > 0.05 而不是 polygon_mask 作为处理范围，让 mean shift
-    # 应用到包括羽化边缘在内的所有「会被看到」的像素。否则多边形内做 shift、羽化外不变，
-    # 在交界处产生 S 形色阶跳变。
+    # ---------- Phase E: 颜色迁移（默认 Reinhard mean shift）-----------------------------
+    # 关键：Pitié 会把 detail noise 的 std 替换成 ref 的低 std，导致毛孔纹理被抹掉
+    # （std 从 12 降到 3）。改用 Reinhard mean shift——只动 mean、保留 std，detail 完整透过。
+    # ref pool 用颊主导（NECK_REF_POOL_LANDMARKS），让目标色对齐脸主体而非颌下阴影。
     if enable_pitie:
-        ref_pixels = gather_lower_face_skin_pixels_bgr(bgra, landmarks, h, w)
+        ref_pixels = _gather_neck_ref_pixels(bgra, landmarks, h, w)
         pitie_mask = refined_alpha > 0.05
-        apply_pitie_to_layer_inplace(
-            blended_bgra, pitie_mask, ref_pixels,
-            strength=pitie_strength, n_iter=PITIE_DEFAULT_ITER, seed=rng_seed,
+        _reinhard_mean_shift_inplace(
+            blended_bgra, pitie_mask, ref_pixels, strength=pitie_strength,
         )
 
     # 应用 alpha 抑制（仅在脸部不透明区域 + 距上沿近的 pixels 抑制脖子 alpha）
@@ -1055,19 +1134,19 @@ def realism_pipeline(
     suppress = np.power(oa, NECK_SUPPRESS_ALPHA_GAMMA) * boundary_envelope
     final_alpha = np.clip(refined_alpha * (1.0 - suppress), 0.0, 1.0)
 
-    # ---------- 底端 vertical fade-out ----------------------------------------------
-    # 头像类原图（无肩膀/无衣领），多边形下端是硬切，看起来像被截断。
-    # 让多边形下 ~35% 高度的 alpha 线性渐隐到 0，模拟「脖子继续向下延伸但超出画面」。
+    # ---------- 底端 vertical fade-out（衣领过渡）-----------------------------------
+    # imagev2 中脖子在 chin+50% jaw_span 处就过渡到衣领（白底图里直接是白）。
+    # 让多边形下 50% 高度的 alpha 渐隐到 0，模拟「脖子下端→衣领→背景」的自然过渡。
     y_min_poly = float(np.min(poly[:, 1]))
     y_max_poly = float(np.max(poly[:, 1]))
     poly_height = max(y_max_poly - y_min_poly, 1.0)
     yy = np.arange(h, dtype=np.float64)[:, None]
     yn_poly = np.clip((yy - y_min_poly) / poly_height, 0.0, 1.0)
-    fade_start = 0.65  # 0.65 → 1.0 段做 fade
+    fade_start = 0.50  # 0.50 → 1.0 段做 fade（之前 0.65，现在更早过渡）
     fade = np.where(
         yn_poly < fade_start,
         1.0,
-        np.clip(1.0 - (yn_poly - fade_start) / (1.0 - fade_start) * 0.92, 0.08, 1.0),
+        np.clip(1.0 - (yn_poly - fade_start) / (1.0 - fade_start), 0.0, 1.0) ** 1.2,
     )
     final_alpha = final_alpha * fade
 
@@ -1096,8 +1175,8 @@ def add_fake_neck_v1(
     neck_bottom_flare: float = 1.05,          # 1.18→1.05：减少底部外扩，配合 fade-out
     neck_width_scale: float = 1.08,
     chin_overlap_px: Optional[float] = None,
-    skin_v_scale: float = 0.92,               # 0.96→0.92：颌下确实更暗
-    skin_h_shift: float = 0.0,                # 取消向暖偏，让 Pitié 决定方向
+    skin_v_scale: float = 1.0,                # 1.0：直接用实测下颌色，让 Reinhard 100% 拉到 ref
+    skin_h_shift: float = 0.0,                # 取消向暖偏，让 Reinhard/Pitié 决定方向
     skin_s_scale: float = 1.0,                # 取消加饱和
     pose_correction: bool = True,
     auto_scale_by_jaw: bool = True,
@@ -1106,10 +1185,11 @@ def add_fake_neck_v1(
     enable_matting: bool = True,
     enable_lap_blend: bool = True,
     enable_pitie: bool = True,
-    pitie_strength: float = 0.85,             # 0.6→0.85：更狠对齐脸部下半部分
-    quilt_method: str = "tile",               # "tile"=单块镜像平铺(默认), "patchquilt"=旧 image quilting
+    pitie_strength: float = 1.0,              # 1.0：完全对齐脸部下半部分均值（实测匹配 imagev2）
+    quilt_method: str = "noise",              # "noise"(默认)=1/f pink noise; "tile"=镜像平铺; "patchquilt"=旧 quilting
     flat_shading: bool = True,                # True=不画圆柱 lit/shadow, 适合 portrait/无衣领
     cylinder_strength: float = 0.30,          # flat_shading=False 时圆柱明暗强度系数
+    neck_depth_frac: float = 1.4,             # neck_depth = jaw_span * neck_depth_frac（1.85→1.4 更短）
     laplacian_levels: int = LAPLACIAN_LEVELS_DEFAULT,
     rng_seed: int = QUILT_RNG_SEED,
     face_mesh: Optional[object] = None,
@@ -1143,7 +1223,7 @@ def add_fake_neck_v1(
             overlap = 17.0
     else:
         overlap = float(np.clip(chin_overlap_px, JAW_SPAN_OVERLAP_MIN_PX, JAW_SPAN_OVERLAP_MAX_PX))
-    neck_depth = max(jaw_span * JAW_SPAN_DEPTH_FRAC, JAW_SPAN_DEPTH_MIN_PX) if auto_scale_by_jaw else 80.0
+    neck_depth = max(jaw_span * float(neck_depth_frac), JAW_SPAN_DEPTH_MIN_PX) if auto_scale_by_jaw else 80.0
     slim = float(np.clip(neck_slim_scale, 0.72, 1.0))
     flare = max(1.02, min(neck_bottom_flare * (neck_width_scale / 1.08), 1.45))
     flare_slim = 1.0 + (flare - 1.0) * slim
@@ -1247,8 +1327,8 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--no-pose-correction", dest="pose_correction", action="store_false")
     parser.add_argument("--no-auto-scale", dest="auto_scale_by_jaw", action="store_false")
     parser.add_argument(
-        "--quilt-method", choices=["tile", "patchquilt"], default="tile",
-        help="纹理方法：tile（默认，单块镜像平铺无接缝）/ patchquilt（旧 image quilting，可能有缝）",
+        "--quilt-method", choices=["noise", "tile", "patchquilt"], default="noise",
+        help="纹理方法：noise（默认，1/f pink noise，无脸结构污染）/ tile（镜像平铺）/ patchquilt（旧）",
     )
     parser.add_argument(
         "--cylinder-shading", dest="flat_shading", action="store_false",
