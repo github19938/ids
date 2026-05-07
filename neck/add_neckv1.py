@@ -445,6 +445,91 @@ def gather_chin_strip_skin_pixels(
     return roi[:, :, :3][valid]
 
 
+# Transplant 模式的 affine 锚点：用 chin / 双下颌角三点做 affine 变换（保 scale + rotation + translate）
+TRANSPLANT_ANCHOR_LANDMARKS = (152, 172, 397)
+TRANSPLANT_TONE_MATCH_STRENGTH = 0.30   # 颜色微调强度：transplant 后再做轻度 Reinhard 适应 head 脸色
+TRANSPLANT_INNER_SHRINK_PX = 1.0        # 内部 mask 微缩，避免 warp 边界残影
+
+
+def transplant_source_neck(
+    head_bgra: np.ndarray,
+    head_landmarks,
+    source_image_path: Optional[str],
+) -> Optional[np.ndarray]:
+    """
+    **真实色彩还原最直接的方法**：把原图（``source_image_path``）的脖子区域用
+    affine 变换 warp 到 head 坐标系，**像素级 1:1 复刻**原图脖子的颜色 + 纹理 + 光照。
+
+    流程：
+      1. 加载 source 图，FaceMesh 检测人脸（独立于 head 的 landmarks）
+      2. 用 chin (152) + 左/右下颌角 (172/397) 三点构造 affine 变换：
+         ``cv2.getAffineTransform(src_pts, head_pts)``
+         三点 affine 同时对齐 scale + rotation + translate
+      3. ``cv2.warpAffine(source, M, (head_w, head_h))`` 把 source 整图 warp 到 head 坐标系
+      4. 返回 warped BGRA 图（与 head 同尺寸）；mask 外像素由 BORDER_REPLICATE 填充
+
+    返回：
+      - (h, w, 4) BGRA uint8: warped 后的 source 图
+      - None: source 路径无效 / FaceMesh 检测失败 / 三点 affine 退化（共线）
+    """
+    if source_image_path is None or not source_image_path:
+        return None
+    try:
+        from neck.add_neck import imread_unicode
+    except ImportError:
+        from add_neck import imread_unicode
+    try:
+        src = imread_unicode(source_image_path)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if src is None or src.ndim != 3:
+        return None
+    if src.shape[2] == 3:
+        src = cv2.cvtColor(src, cv2.COLOR_BGR2BGRA)
+        src[:, :, 3] = 255
+    elif src.shape[2] != 4:
+        return None
+
+    sH, sW = src.shape[:2]
+    src_rgb = cv2.cvtColor(src[:, :, :3], cv2.COLOR_BGR2RGB)
+    src_landmarks = detect_face_with_retry(src_rgb)
+    if src_landmarks is None:
+        return None
+
+    h, w = head_bgra.shape[:2]
+    head_pts = np.array(
+        [landmark_xy(head_landmarks.landmark[i], w, h) for i in TRANSPLANT_ANCHOR_LANDMARKS],
+        dtype=np.float32,
+    )
+    src_pts = np.array(
+        [landmark_xy(src_landmarks.landmark[i], sW, sH) for i in TRANSPLANT_ANCHOR_LANDMARKS],
+        dtype=np.float32,
+    )
+    # 检查三点不共线（否则 affine 退化）
+    v1 = head_pts[1] - head_pts[0]
+    v2 = head_pts[2] - head_pts[0]
+    cross = abs(v1[0] * v2[1] - v1[1] * v2[0])
+    if cross < 1.0:
+        return None
+    v1s = src_pts[1] - src_pts[0]
+    v2s = src_pts[2] - src_pts[0]
+    cross_s = abs(v1s[0] * v2s[1] - v1s[1] * v2s[0])
+    if cross_s < 1.0:
+        return None
+
+    try:
+        M = cv2.getAffineTransform(src_pts, head_pts)
+    except cv2.error:
+        return None
+
+    warped = cv2.warpAffine(
+        src, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return warped
+
+
 def gather_source_neck_skin_pixels(
     source_image_path: Optional[str],
 ) -> Optional[np.ndarray]:
@@ -1274,6 +1359,7 @@ def realism_pipeline(
     rng_seed: int = QUILT_RNG_SEED,
     quilt_method: str = "tile",
     source_neck_pixels: Optional[np.ndarray] = None,
+    source_warped_bgra: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, V1DebugInfo]:
     """
     Phase A 之"真实感主流程"：在 procedural 层之上跑 B/C/D/E。
@@ -1354,6 +1440,24 @@ def realism_pipeline(
         blended_bgr = quilted.copy()
     else:
         blended_bgr = procedural_layer[:, :, :3].copy()
+
+    # ---------- Transplant 替换：用原图脖子像素 1:1 替换合成脖子 BGR -----------------
+    # 保留 procedural 的"形状/光照框架"和 mask，仅在 mask 内**用原图真实像素覆盖** BGR。
+    # 边缘做一像素级羽化避免 warp 残影。
+    if source_warped_bgra is not None and source_warped_bgra.shape[:2] == (h, w):
+        # 用 mask_bool 内部稍微 erode 一圈避免 warp 边界混色
+        eroded_mask = cv2.erode(
+            mask_bool.astype(np.uint8) * 255,
+            np.ones((3, 3), np.uint8),
+            iterations=1,
+        )
+        em = eroded_mask > 0
+        # 中央用原图，mask 边缘 1px 平滑过渡到 procedural detail（避免硬接缝）
+        blended_bgr_arr = blended_bgr.astype(np.float32)
+        warped_bgr = source_warped_bgra[:, :, :3].astype(np.float32)
+        blended_bgr = np.where(em[..., None], warped_bgr, blended_bgr_arr)
+        blended_bgr = np.clip(blended_bgr, 0, 255).astype(np.uint8)
+
     blended_bgra = np.dstack([blended_bgr, polygon_mask_u8])
 
     # ---------- Phase C 先做 alpha 求解（把范围扩到 feather 全境）---------------------
@@ -1366,14 +1470,24 @@ def realism_pipeline(
 
     # ---------- Phase E: 颜色迁移 ----------------------------------------------------
     # 优先级：
-    #   1. 若 source_neck_pixels 非空（用户提供原图且检测到脖子）→ **严格按原图脖子色**
-    #      作 ref pool（不混合 chin/oval）
+    #   0. 若 transplant 模式（source_warped_bgra 已成功 warp 过来）→ BGR 已是原图真实
+    #      色，仅需要轻度（strength=0.30）Reinhard 适应 head 脸色光照差异，避免脖子
+    #      偏离 head 整体色调。
+    #   1. 若 source_neck_pixels 非空（提供原图但 transplant 没启用 / 几何对齐失败）→
+    #      严格按原图脖子色作 ref pool（不混合 chin/oval）
     #   2. 否则走「下巴过渡区 + 脸部 oval 最亮 40%」混合（chin 仅 15% 权重，避免拉暗）
     ref_pixels = np.empty((0, 3), dtype=np.uint8)
     ref_source = "none"
+    transplant_active = source_warped_bgra is not None and source_warped_bgra.shape[:2] == (h, w)
     if enable_pitie:
-        if source_neck_pixels is not None and source_neck_pixels.shape[0] >= SOURCE_NECK_MIN_PIXELS:
-            # 路径 1：原图有脖子，严格用原图脖子色
+        if transplant_active:
+            # transplant 模式：仅用 head 自身脸色作 ref，做轻度光照对齐
+            ref_pixels = gather_face_oval_skin_pixels(bgra, landmarks, h, w)
+            if ref_pixels.shape[0] < 200:
+                ref_pixels = _gather_neck_ref_pixels(bgra, landmarks, h, w)
+            ref_source = "transplant_light_match"
+        elif source_neck_pixels is not None and source_neck_pixels.shape[0] >= SOURCE_NECK_MIN_PIXELS:
+            # 路径 1：原图有脖子但没 transplant，严格用原图脖子色
             ref_pixels = source_neck_pixels
             ref_source = "source_image_neck"
         else:
@@ -1402,9 +1516,13 @@ def realism_pipeline(
 
         if ref_pixels.shape[0] >= 8:
             pitie_mask = polygon_mask_u8 >= 1
+            # transplant 模式用更低强度（仅适应光照），其他路径用原 strength
+            effective_strength = (
+                TRANSPLANT_TONE_MATCH_STRENGTH if transplant_active else pitie_strength
+            )
             _apply_L_meanshift_ab_cdf_inplace(
                 blended_bgra, pitie_mask, ref_pixels,
-                strength=pitie_strength, alpha_map=refined_alpha,
+                strength=effective_strength, alpha_map=refined_alpha,
             )
 
     # ---------- 方案 5: 胡茬检测 + 颌下暗调叠加 -------------------------------------
@@ -1564,8 +1682,13 @@ def add_fake_neck_v1(
         cylinder_strength=cylinder_strength,
     )
 
-    # 若提供了原图路径，尝试从中提取真实脖子肤色像素（None = 未提供 / 未检测到脖子）
+    # 若提供了原图路径，尝试做 transplant（最大限度还原真实脖子色彩）
+    source_warped = transplant_source_neck(bgra, landmarks, source_image_path)
+    # 同时（作 fallback ref pool）提取像素池
     source_neck_pixels = gather_source_neck_skin_pixels(source_image_path)
+
+    # transplant 成功时禁用胡茬阴影（原图脖子已包含真实胡茬阴影，再叠加会变双倍）
+    effective_enable_stubble = enable_stubble and source_warped is None
 
     final_layer, info = realism_pipeline(
         bgra, landmarks, proc_layer, mask_u8, poly, jaw_span,
@@ -1573,12 +1696,13 @@ def add_fake_neck_v1(
         enable_matting=enable_matting,
         enable_lap_blend=enable_lap_blend,
         enable_pitie=enable_pitie,
-        enable_stubble=enable_stubble,
+        enable_stubble=effective_enable_stubble,
         pitie_strength=pitie_strength,
         laplacian_levels=laplacian_levels,
         rng_seed=rng_seed,
         quilt_method=quilt_method,
         source_neck_pixels=source_neck_pixels,
+        source_warped_bgra=source_warped,
     )
     info = info._replace(pose=(yaw, pitch, roll))
 
