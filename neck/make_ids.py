@@ -37,9 +37,9 @@ class MakeIDPhoto:
     # ============ 脖子几何参数（经验值）============
     NECK_TOP_INSET = 0.95        # 脖子顶宽 / 下颌宽（接近 1 = 几乎=下颌宽）
     NECK_BOTTOM_FLARE = 1.0      # 脖子底宽 / 顶宽（不外扩）
-    NECK_DEPTH_FRAC = 1.20       # 脖子 polygon 高度 = jaw_span × 此值（要 ≥ visible+buffer）
+    NECK_DEPTH_FRAC = 1.80       # 脖子 polygon 高度 = jaw_span × 此值（1.20→1.80 让脖子更长）
     CHIN_OVERLAP_FRAC = 0.06     # 脖子上沿向上插入下巴的距离 / jaw_span
-    NECK_DRAWING_PAD_FACTOR = 1.6  # 加脖子前底部预留 padding = jaw_span × 此值（≥ NECK_DEPTH_FRAC）
+    NECK_DRAWING_PAD_FACTOR = 2.2  # 加脖子前底部预留 padding = jaw_span × 此值（≥ NECK_DEPTH_FRAC）
 
     # ============ 衣服 / 画布几何参数（经验值）============
     HEAD_JAW_TO_CANVAS_RATIO = 0.20   # canvas 上 scaled_jaw_span / canvas_w
