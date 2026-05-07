@@ -216,7 +216,10 @@ class MakeIDPhoto:
     ) -> np.ndarray:
         """
         方案 A：把 source 中真实脖子段（chin+REAL_NECK_TOP_FRAC ~ chin+REAL_NECK_BOT_FRAC）
-        纵向 cv2.resize 到目标长度，替换 chin 之下的所有内容（含原 T 恤）。
+        纵向 cv2.resize 到目标长度，写入到 chin+CHIN_OVERLAP_FRAC 起的范围。
+
+        ★ 保留 source 中 chin → chin+CHIN_OVERLAP_FRAC×jaw_span 这段不动，
+          保证 polygon 上沿 chin_overlap 衔接区域内容跟拉伸前完全一致。
 
         若 source 高度不足装下拉伸后的内容，自动扩展画布（向下加透明 padding）。
         affine 锚点（chin / 下颌角）不动，warp 矩阵不受影响。
@@ -240,25 +243,29 @@ class MakeIDPhoto:
         if real_bot - real_top < 5:
             return source_bgra
 
-        # 想要的脖子总长度（从 chin 起，按 source jaw_span 比例）
-        target_h = max(int(round(jaw_span * self.neck_target_length)), real_bot - real_top)
+        # 写入起点：保留 chin → chin+chin_overlap 这段不动，从 chin_overlap 之后开始替换
+        write_top = chin_y + int(round(jaw_span * self.CHIN_OVERLAP_FRAC))
+        # 写入终点：从 chin 起 neck_target_length × jaw_span（保证 polygon 下沿装得下）
+        write_bot = chin_y + int(round(jaw_span * self.neck_target_length))
+        write_h = write_bot - write_top
+        if write_h <= 0:
+            return source_bgra
 
         # 取真实脖子段
         strip = source_bgra[real_top:real_bot, :, :]
-        # 纵向 cv2.resize 到目标高度（INTER_LINEAR：上采样保持柔和）
-        flag = cv2.INTER_LINEAR if target_h > (real_bot - real_top) else cv2.INTER_AREA
-        stretched = cv2.resize(strip, (w, target_h), interpolation=flag)
+        # 纵向 cv2.resize 到写入高度（INTER_LINEAR：上采样保持柔和）
+        flag = cv2.INTER_LINEAR if write_h > (real_bot - real_top) else cv2.INTER_AREA
+        stretched = cv2.resize(strip, (w, write_h), interpolation=flag)
 
-        # 如果 source 高度不够装下 chin + target_h 的内容，扩展画布
-        new_bot_y = chin_y + target_h
-        if new_bot_y > h:
-            out = np.zeros((new_bot_y, w, 4), dtype=source_bgra.dtype)
+        # 如果 source 高度不够装下 write_bot，扩展画布
+        if write_bot > h:
+            out = np.zeros((write_bot, w, 4), dtype=source_bgra.dtype)
             out[:h, :, :] = source_bgra
         else:
             out = source_bgra.copy()
 
-        # 把 chin → chin + target_h 之间的内容替换为拉伸的脖子段
-        out[chin_y:chin_y + target_h, :, :] = stretched
+        # 仅替换 write_top → write_bot；chin → write_top 那段保留 source 原貌
+        out[write_top:write_bot, :, :] = stretched
         return out
 
     def _apply_pink_noise_to_neck_band(
@@ -281,7 +288,9 @@ class MakeIDPhoto:
         if jaw_span < 12.0:
             return source_bgra
 
-        band_top = chin_y
+        # 跟 _stretch_source_neck 写入区一致：跳过 chin → chin+chin_overlap 那段
+        # 保证 polygon 上沿 chin_overlap 衔接区域无 noise，跟拉伸前一致
+        band_top = chin_y + int(round(jaw_span * self.CHIN_OVERLAP_FRAC))
         band_bot = min(chin_y + int(round(jaw_span * self.neck_target_length)), h)
         region_h = band_bot - band_top
         if region_h < 10 or w < 10:
