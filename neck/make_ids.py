@@ -52,8 +52,12 @@ class MakeIDPhoto:
     # 拉伸后脖子段总长度 / source_jaw_span。要 ≥ NECK_DEPTH_FRAC 才能让 polygon 完全装下拉伸内容
     NECK_TARGET_LENGTH_FRAC = 2.0
     # 真实脖子段在 source 中的 y 范围（chin 下方）
-    REAL_NECK_TOP_FRAC = 0.05    # 起始 = chin + 0.05 × jaw_span（避开 chin AA 边）
+    # 必须从 chin 紧邻下方起（=chin_y），保证拉伸段顶端 = 下巴投影区色调
+    # 与脸下沿自然衔接，不会出现色块对接错乱
+    REAL_NECK_TOP_FRAC = 0.0     # 起始 = chin（紧邻下方，不留间隙）
     REAL_NECK_BOT_FRAC = 0.40    # 结束 = chin + 0.40 × jaw_span（避开衣领顶端）
+    # noise 在 chin 处的羽化过渡距离 / source_jaw_span（避免 chin 处 noise 强度突变）
+    NOISE_TOP_FADE_FRAC = 0.10
     # 方案 E 的 1/f pink noise 参数（实测匹配真实皮肤毛孔频谱）
     NOISE_SIGMA = 4.0            # noise 强度（imagev2 实测高频 std≈1，对应 sigma≈4-5）
     NOISE_ALPHA = 0.30           # 1/f^0.3 频谱（接近白噪声但能量在高频，模拟毛孔）
@@ -297,6 +301,13 @@ class MakeIDPhoto:
         noise_3c = np.stack(
             [noise_gray * 0.95, noise_gray * 1.00, noise_gray * 1.05], axis=-1,
         ).astype(np.float32)
+
+        # ★ 顶部 fade_h 像素 alpha 0→1 线性渐变，消除 chin 处 noise 强度突变
+        fade_h = max(2, int(round(jaw_span * self.NOISE_TOP_FADE_FRAC)))
+        fade_h = min(fade_h, region_h)
+        fade_curve = np.ones(region_h, dtype=np.float32)
+        fade_curve[:fade_h] = np.linspace(0.0, 1.0, fade_h, dtype=np.float32)
+        noise_3c = noise_3c * fade_curve[:, None, None]
 
         out = source_bgra.copy()
         region = out[band_top:band_bot, :, :].astype(np.float32)
