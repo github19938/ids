@@ -2,19 +2,17 @@
 """
 add_clothes.py
 ==============
-用 抠图头像 + 原图 + 衣服模板 合成蓝底证件照。
+用 抠图头像 + 衣服模板 合成蓝底证件照（已去掉脖子延长逻辑）。
 
 流程：
-  1. 用 ``add_neckv1.add_fake_neck_v1`` 在头像下方延伸真实脖子（``--source-image``
-     transplant 模式 1:1 复刻原图脖子色彩）。
-  2. 衣服模板按头像 jaw_span 比例缩放，V 领顶点对齐到 chin 下方一段距离（让
-     脖子从衣领里露出来）。
+  1. 头像按 jaw_span 比例缩放，按经验位置贴到画布上。
+  2. 衣服模板 V 领顶点对齐到 chin 下方一段距离（让脖子从衣领里露出来）。
   3. 蓝底画布 + 合成层级：
-        蓝底 ← 衣服模板 ← 带脖子的头像（最上层）
+        蓝底 ← 衣服模板 ← 头像（最上层）
 
 入口：
   - ``add_clothes(...)`` 主函数（可被 import 调用）
-  - CLI: ``python add_clothes.py --head head.png --source src.png --clothes c.png -o out.png``
+  - CLI: ``python add_clothes.py --head head.png --clothes c.png -o out.png``
 """
 
 from __future__ import annotations
@@ -28,21 +26,19 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-# 复用 add_neck.py / add_neckv1.py 的助手
+# 复用 add_neck.py 的助手（不再依赖 add_neckv1，因为脖子延长逻辑已去除）
 try:
     from neck.add_neck import (  # type: ignore
         load_rgba, imread_unicode, imwrite_unicode, bgra_to_rgb,
         landmark_xy, alpha_over, detect_face_with_retry,
         LANDMARK_CHIN_BOTTOM, LANDMARK_LEFT_JAW_ON_OVAL, LANDMARK_RIGHT_JAW_ON_OVAL,
     )
-    from neck.add_neckv1 import add_fake_neck_v1  # type: ignore
 except ImportError:
     from add_neck import (  # type: ignore
         load_rgba, imread_unicode, imwrite_unicode, bgra_to_rgb,
         landmark_xy, alpha_over, detect_face_with_retry,
         LANDMARK_CHIN_BOTTOM, LANDMARK_LEFT_JAW_ON_OVAL, LANDMARK_RIGHT_JAW_ON_OVAL,
     )
-    from add_neckv1 import add_fake_neck_v1  # type: ignore
 
 
 # =====================================================================================
@@ -71,42 +67,11 @@ NECK_VISIBLE_TO_JAW_SPAN_RATIO: float = 0.70
 # 衣服顶部 V 领顶点的 fallback 位置（自动检测失败时用）
 CLOTHES_TEMPLATE_VNECK_X_FRAC: float = 0.50
 CLOTHES_TEMPLATE_VNECK_Y_FRAC: float = 0.18
-# 头部检测+延长脖子的临时 PNG（中间产物）
-TEMP_HEAD_WITH_NECK_NAME: str = "_tmp_head_with_neck.png"
 
 
 # =====================================================================================
 # 主函数
 # =====================================================================================
-
-
-# 调用 add_fake_neck_v1 前，确保 chin 下方有足够空间画脖子。
-# add_neckv1 的脖子 polygon 高度 = jaw_span × JAW_SPAN_DEPTH_FRAC × slim ≈ jaw_span × 1.4 × 0.87 ≈ 1.22。
-# 留 1.5x 余量。
-NECK_DRAWING_BOTTOM_PAD_FACTOR: float = 1.5
-
-
-def _ensure_neck_drawing_space(bgra: np.ndarray) -> Tuple[np.ndarray, int]:
-    """
-    若 chin 下方在画布内剩余像素 < jaw_span × NECK_DRAWING_BOTTOM_PAD_FACTOR，
-    在画布底部加透明 padding，让 add_fake_neck_v1 有足够空间绘制脖子。
-
-    返回 (扩展后 bgra, 加了多少 px 的底部 pad)。
-    """
-    detected = _detect_chin_and_jaw_span(bgra)
-    if detected is None:
-        return bgra, 0
-    chin_x, chin_y, jaw_span = detected
-    h, w = bgra.shape[:2]
-    needed = int(round(jaw_span * NECK_DRAWING_BOTTOM_PAD_FACTOR))
-    available = h - int(chin_y)
-    if available >= needed:
-        return bgra, 0
-    pad = needed - available
-    out = np.zeros((h + pad, w, 4), dtype=np.uint8)
-    out[:h, :, :] = bgra
-    # 底部 padding 区 alpha=0（透明），不会影响合成
-    return out, pad
 
 
 def _detect_chin_and_jaw_span(bgra: np.ndarray) -> Optional[Tuple[float, float, float]]:
@@ -219,72 +184,43 @@ def add_clothes(
     head_image_path: str,
     clothes_template_path: str,
     output_path: str,
-    source_image_path: Optional[str] = None,
     bg_color_bgr: Tuple[int, int, int] = ID_PHOTO_BLUE_BGR,
     head_jaw_to_canvas_ratio: float = HEAD_JAW_SPAN_TO_CANVAS_W_RATIO,
     head_top_margin_to_canvas_ratio: float = HEAD_TOP_MARGIN_TO_CANVAS_W_RATIO,
     neck_visible_to_jaw_ratio: float = NECK_VISIBLE_TO_JAW_SPAN_RATIO,
-    keep_temp_files: bool = False,
 ) -> int:
     """
-    用抠图头像 + 原图 + 衣服模板合成蓝底证件照。
+    用抠图头像 + 衣服模板合成蓝底证件照（不再补脖子，头像直接进入合成流程）。
 
     **几何定位策略**（以衣服模板为基准 + 经验值像素定位）：
       - canvas 宽度 = 衣服模板原始宽度（衣服不缩放，保留细节）
       - canvas 高度 = 自动推导 = 头顶 margin + 头部高 + 脖子可见 + 衣服尚下部分
       - 头部缩放比例：让 scaled_jaw_span = canvas_w × ``head_jaw_to_canvas_ratio``
       - 脖子可见高度：scaled_jaw_span × ``neck_visible_to_jaw_ratio``
-      - 衣服 V 领顶点位置 = chin_y_in_canvas + 脖子可见高度（让脖子从衣领里露出来）
+      - 衣服 V 领顶点位置 = chin_y_in_canvas + 脖子可见高度（让头像 chin 下方
+        可见区域 / 衣领开口对齐）
 
     :param head_image_path: 抠图好的头像路径（RGBA 透明背景）
     :param clothes_template_path: 衣服模板路径（RGBA 衣服图，**不缩放**）
     :param output_path: 输出蓝底证件照路径
-    :param source_image_path: 同人完整原图路径（用于 transplant 1:1 真实脖子色彩）
     :param bg_color_bgr: 背景色（默认证件照蓝 BGR=(219,142,67)）
     :param head_jaw_to_canvas_ratio: jaw_span / canvas_w，默认 0.20（脸宽约 1/5 画布）
     :param head_top_margin_to_canvas_ratio: 头顶 margin / canvas_w，默认 0.11
     :param neck_visible_to_jaw_ratio: 脖子可见高度 / scaled_jaw_span，默认 0.70
-    :param keep_temp_files: 是否保留中间产物（带脖子的头像 PNG）
     :return: 0 成功, 非零失败
     """
-    # ============ 1. 在头像下方加真实脖子 ============
     out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
     os.makedirs(out_dir, exist_ok=True)
-    tmp_head_path = os.path.join(out_dir, TEMP_HEAD_WITH_NECK_NAME)
 
+    # ============ 1. 加载头像并检测 chin / jaw_span ============
     head_bgra = load_rgba(head_image_path)
     detected = _detect_chin_and_jaw_span(head_bgra)
     if detected is None:
         print(f"[错误] 头像中未检测到人脸: {head_image_path}", file=sys.stderr)
         return 1
+    chin_x, chin_y, jaw_span = detected
 
-    # ★ 关键：image0 等抠图常常画布卡到 chin（chin 离底部仅 0-5px），
-    # 加脖子前必须先扩展底部画布，否则 polygon 没空间画。
-    head_bgra_expanded, pad_added = _ensure_neck_drawing_space(head_bgra)
-    if pad_added > 0:
-        print(f"[信息] 原画布 chin 下空间不足，已在底部加 {pad_added}px 透明 padding")
-
-    try:
-        head_with_neck, _skin_marked = add_fake_neck_v1(
-            head_bgra_expanded,
-            source_image_path=source_image_path,
-            for_clothes_compositing=True,  # ★ 衣领合成模式：脖子塞满 V 领、不 fade、色调更主动适应
-        )
-    except Exception as e:
-        print(f"[错误] 添加脖子失败: {e}", file=sys.stderr)
-        return 1
-
-    if keep_temp_files:
-        imwrite_unicode(tmp_head_path, head_with_neck)
-
-    # 重新检测脖子图上的 chin / jaw_span（用于位置对齐）
-    detected2 = _detect_chin_and_jaw_span(head_with_neck)
-    if detected2 is None:
-        print("[错误] 加完脖子后人脸检测失败", file=sys.stderr)
-        return 1
-    chin_x, chin_y, jaw_span = detected2
-
-    head_bbox = _compute_head_bbox(head_with_neck)
+    head_bbox = _compute_head_bbox(head_bgra)
     if head_bbox is None:
         print("[错误] 无法获取头像 bbox", file=sys.stderr)
         return 1
@@ -312,10 +248,10 @@ def add_clothes(
     target_jaw_span_in_canvas = canvas_w * head_jaw_to_canvas_ratio
     scale = target_jaw_span_in_canvas / float(jaw_span)
 
-    src_h, src_w = head_with_neck.shape[:2]
+    src_h, src_w = head_bgra.shape[:2]
     scaled_w = max(1, int(round(src_w * scale)))
     scaled_h = max(1, int(round(src_h * scale)))
-    scaled_head = _resize_with_alpha(head_with_neck, scaled_w, scaled_h)
+    scaled_head = _resize_with_alpha(head_bgra, scaled_w, scaled_h)
     scaled_chin_x = int(round(chin_x * scale))
     scaled_chin_y = int(round(chin_y * scale))
     scaled_by0 = int(round(by0 * scale))  # 头顶 y in scaled_head
@@ -370,13 +306,6 @@ def add_clothes(
         f"neck_visible={neck_visible_h}px, "
         f"vneck_at=({target_vneck_x_in_canvas},{target_vneck_y_in_canvas})"
     )
-    if keep_temp_files:
-        print(f"中间产物（带脖子头像）: {tmp_head_path}")
-    elif os.path.exists(tmp_head_path):
-        try:
-            os.remove(tmp_head_path)
-        except OSError:
-            pass
     return 0
 
 
@@ -387,14 +316,10 @@ def add_clothes(
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="抠图头像 + 原图 + 衣服模板 → 蓝底证件照",
+        description="抠图头像 + 衣服模板 → 蓝底证件照（不再补脖子）",
     )
     parser.add_argument("--head", required=True, help="抠图好的头像路径（RGBA）")
     parser.add_argument("--clothes", required=True, help="衣服模板路径（RGBA）")
-    parser.add_argument(
-        "--source", default=None,
-        help="同人完整原图路径，用于真实脖子色彩 transplant；为空时走合成 fallback",
-    )
     parser.add_argument("-o", "--output", required=True, help="输出证件照路径")
     parser.add_argument(
         "--bg-color", default="219,142,67",
@@ -414,10 +339,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="脖子可见高度 / scaled_jaw_span 比例，默认 0.70。"
         "调大 → 脖子更长（V 领更远）；调小 → V 领更近 chin",
     )
-    parser.add_argument(
-        "--keep-temp", action="store_true",
-        help="保留中间产物（带脖子的头像 PNG）",
-    )
     args = parser.parse_args(argv)
 
     bg_parts = [int(x.strip()) for x in args.bg_color.split(",")]
@@ -430,12 +351,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         head_image_path=os.path.abspath(args.head),
         clothes_template_path=os.path.abspath(args.clothes),
         output_path=os.path.abspath(args.output),
-        source_image_path=os.path.abspath(args.source) if args.source else None,
         bg_color_bgr=bg_color,  # type: ignore
         head_jaw_to_canvas_ratio=args.head_jaw_ratio,
         head_top_margin_to_canvas_ratio=args.head_top_margin,
         neck_visible_to_jaw_ratio=args.neck_visible_ratio,
-        keep_temp_files=args.keep_temp,
     )
 
 
