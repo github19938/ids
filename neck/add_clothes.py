@@ -184,6 +184,7 @@ def add_clothes(
     head_image_path: str,
     clothes_template_path: str,
     output_path: str,
+    source_image_path: Optional[str] = None,
     bg_color_bgr: Tuple[int, int, int] = ID_PHOTO_BLUE_BGR,
     head_jaw_to_canvas_ratio: float = HEAD_JAW_SPAN_TO_CANVAS_W_RATIO,
     head_top_margin_to_canvas_ratio: float = HEAD_TOP_MARGIN_TO_CANVAS_W_RATIO,
@@ -203,12 +204,15 @@ def add_clothes(
     :param head_image_path: 抠图好的头像路径（RGBA 透明背景）
     :param clothes_template_path: 衣服模板路径（RGBA 衣服图，**不缩放**）
     :param output_path: 输出蓝底证件照路径
+    :param source_image_path: [已弃用] 过去用于脖子色彩 transplant；脖子延长逻辑
+        已去除，此参数被忽略，仅为兼容旧脚本保留
     :param bg_color_bgr: 背景色（默认证件照蓝 BGR=(219,142,67)）
     :param head_jaw_to_canvas_ratio: jaw_span / canvas_w，默认 0.20（脸宽约 1/5 画布）
     :param head_top_margin_to_canvas_ratio: 头顶 margin / canvas_w，默认 0.11
     :param neck_visible_to_jaw_ratio: 脖子可见高度 / scaled_jaw_span，默认 0.70
     :return: 0 成功, 非零失败
     """
+    del source_image_path  # 兼容旧调用，不使用
     out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
     os.makedirs(out_dir, exist_ok=True)
 
@@ -320,6 +324,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--head", required=True, help="抠图好的头像路径（RGBA）")
     parser.add_argument("--clothes", required=True, help="衣服模板路径（RGBA）")
+    parser.add_argument(
+        "--source", default=None,
+        help="[已弃用] 同人完整原图路径，过去用于脖子色彩 transplant；"
+        "脖子延长逻辑已去除，此参数被忽略，仅为兼容旧脚本保留",
+    )
     parser.add_argument("-o", "--output", required=True, help="输出证件照路径")
     parser.add_argument(
         "--bg-color", default="219,142,67",
@@ -351,6 +360,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         head_image_path=os.path.abspath(args.head),
         clothes_template_path=os.path.abspath(args.clothes),
         output_path=os.path.abspath(args.output),
+        source_image_path=os.path.abspath(args.source) if args.source else None,
         bg_color_bgr=bg_color,  # type: ignore
         head_jaw_to_canvas_ratio=args.head_jaw_ratio,
         head_top_margin_to_canvas_ratio=args.head_top_margin,
