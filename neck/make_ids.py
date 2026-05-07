@@ -37,9 +37,27 @@ class MakeIDPhoto:
     # ============ 脖子几何参数（经验值）============
     NECK_TOP_INSET = 0.95        # 脖子顶宽 / 下颌宽（接近 1 = 几乎=下颌宽）
     NECK_BOTTOM_FLARE = 1.0      # 脖子底宽 / 顶宽（不外扩）
-    NECK_DEPTH_FRAC = 1.80       # 脖子 polygon 高度 = jaw_span × 此值（1.20→1.80 让脖子更长）
+    NECK_DEPTH_FRAC = 1.80       # 脖子 polygon 高度 = jaw_span × 此值
     CHIN_OVERLAP_FRAC = 0.06     # 脖子上沿向上插入下巴的距离 / jaw_span
     NECK_DRAWING_PAD_FACTOR = 2.2  # 加脖子前底部预留 padding = jaw_span × 此值（≥ NECK_DEPTH_FRAC）
+
+    # ============ source 脖子拉伸参数（解决原图脖子太短的限制）============
+    # STRETCH_MODE_NONE: 不拉伸——polygon 下半 warp 进原图衣领（受原图限制）
+    # STRETCH_MODE_LINEAR: 方案 A——把 source 真实脖子段纵向 cv2.resize 到目标长度替换 chin 之下
+    # STRETCH_MODE_NOISE:  方案 E（默认）——方案 A + 在 source 拉伸段叠加 1/f pink noise 补回毛孔
+    STRETCH_MODE_NONE = "none"
+    STRETCH_MODE_LINEAR = "linear"
+    STRETCH_MODE_NOISE = "noise"
+    DEFAULT_STRETCH_MODE = STRETCH_MODE_NOISE
+    # 拉伸后脖子段总长度 / source_jaw_span。要 ≥ NECK_DEPTH_FRAC 才能让 polygon 完全装下拉伸内容
+    NECK_TARGET_LENGTH_FRAC = 2.0
+    # 真实脖子段在 source 中的 y 范围（chin 下方）
+    REAL_NECK_TOP_FRAC = 0.05    # 起始 = chin + 0.05 × jaw_span（避开 chin AA 边）
+    REAL_NECK_BOT_FRAC = 0.40    # 结束 = chin + 0.40 × jaw_span（避开衣领顶端）
+    # 方案 E 的 1/f pink noise 参数（实测匹配真实皮肤毛孔频谱）
+    NOISE_SIGMA = 4.0            # noise 强度（imagev2 实测高频 std≈1，对应 sigma≈4-5）
+    NOISE_ALPHA = 0.30           # 1/f^0.3 频谱（接近白噪声但能量在高频，模拟毛孔）
+    NOISE_BLUR_SIGMA = 1.0       # noise 后高斯模糊柔化（消砂砾感）
 
     # ============ 衣服 / 画布几何参数（经验值）============
     HEAD_JAW_TO_CANVAS_RATIO = 0.20   # canvas 上 scaled_jaw_span / canvas_w
@@ -72,6 +90,8 @@ class MakeIDPhoto:
         clothes_scale: Optional[float] = None,
         clothes_y_offset_ratio: Optional[float] = None,
         clothes_vneck_dilate_px: Optional[int] = None,
+        stretch_mode: Optional[str] = None,
+        neck_target_length: Optional[float] = None,
     ):
         """
         :param head_path: 抠图头像路径（RGBA PNG，背景透明）
@@ -108,6 +128,19 @@ class MakeIDPhoto:
         self.clothes_vneck_dilate_px = (
             int(np.clip(clothes_vneck_dilate_px, 0, 200))
             if clothes_vneck_dilate_px is not None else self.CLOTHES_VNECK_DILATE_PX
+        )
+        valid_modes = (self.STRETCH_MODE_NONE, self.STRETCH_MODE_LINEAR, self.STRETCH_MODE_NOISE)
+        if stretch_mode is None:
+            self.stretch_mode = self.DEFAULT_STRETCH_MODE
+        elif stretch_mode in valid_modes:
+            self.stretch_mode = stretch_mode
+        else:
+            raise ValueError(
+                f"stretch_mode 必须是 {valid_modes}，传入了 {stretch_mode!r}"
+            )
+        self.neck_target_length = (
+            float(np.clip(neck_target_length, 0.50, 4.0))
+            if neck_target_length is not None else self.NECK_TARGET_LENGTH_FRAC
         )
 
     # =================================================================================
@@ -149,6 +182,134 @@ class MakeIDPhoto:
     # 核心方法 1：加脖子（affine warp 原图脖子像素到头像坐标系）
     # =================================================================================
 
+    # =================================================================================
+    # source 拉伸辅助（方案 A: linear / 方案 E: noise）
+    # =================================================================================
+
+    @staticmethod
+    def _generate_pink_noise_2d(
+        h: int, w: int, sigma: float = 4.0, alpha: float = 0.30, seed: int = 0,
+    ) -> np.ndarray:
+        """
+        生成 (h, w) float32 1/f^alpha pink noise，归一化到目标 std=sigma。
+        1/f^0.3 频谱接近白噪声但能量集中在高频，模拟真实皮肤毛孔。
+        """
+        rng = np.random.default_rng(seed)
+        white = rng.standard_normal((h, w)).astype(np.float32)
+        F = np.fft.fft2(white)
+        fx = np.fft.fftfreq(w).astype(np.float32)
+        fy = np.fft.fftfreq(h).astype(np.float32)
+        Fx, Fy = np.meshgrid(fx, fy)
+        radius = np.sqrt(Fx * Fx + Fy * Fy)
+        safe_r = np.where(radius > 0, radius, 1.0)
+        scale = (1.0 / safe_r) ** (alpha / 2.0)
+        scale = scale.astype(np.float32)
+        scale[0, 0] = 0.0  # 抹掉 DC 分量
+        pink = np.real(np.fft.ifft2(F * scale)).astype(np.float32)
+        s = float(pink.std())
+        if s > 1e-6:
+            pink *= float(sigma) / s
+        return pink
+
+    def _stretch_source_neck(
+        self, source_bgra: np.ndarray, source_face,
+    ) -> np.ndarray:
+        """
+        方案 A：把 source 中真实脖子段（chin+REAL_NECK_TOP_FRAC ~ chin+REAL_NECK_BOT_FRAC）
+        纵向 cv2.resize 到目标长度，替换 chin 之下的所有内容（含原 T 恤）。
+
+        若 source 高度不足装下拉伸后的内容，自动扩展画布（向下加透明 padding）。
+        affine 锚点（chin / 下颌角）不动，warp 矩阵不受影响。
+        """
+        h, w = source_bgra.shape[:2]
+        lm = source_face.landmark
+        chin_y = int(lm[self.LANDMARK_CHIN].y * h)
+        jl_x = lm[self.LANDMARK_LEFT_JAW].x * w
+        jl_y = lm[self.LANDMARK_LEFT_JAW].y * h
+        jr_x = lm[self.LANDMARK_RIGHT_JAW].x * w
+        jr_y = lm[self.LANDMARK_RIGHT_JAW].y * h
+        jaw_span = float(np.hypot(jl_x - jr_x, jl_y - jr_y))
+        if jaw_span < 12.0:
+            return source_bgra
+
+        # 真实脖子段（避开 chin AA 边 + 衣领上端）
+        real_top = chin_y + int(round(jaw_span * self.REAL_NECK_TOP_FRAC))
+        real_bot = chin_y + int(round(jaw_span * self.REAL_NECK_BOT_FRAC))
+        real_top = max(real_top, chin_y)
+        real_bot = min(real_bot, h - 1)
+        if real_bot - real_top < 5:
+            return source_bgra
+
+        # 想要的脖子总长度（从 chin 起，按 source jaw_span 比例）
+        target_h = max(int(round(jaw_span * self.neck_target_length)), real_bot - real_top)
+
+        # 取真实脖子段
+        strip = source_bgra[real_top:real_bot, :, :]
+        # 纵向 cv2.resize 到目标高度（INTER_LINEAR：上采样保持柔和）
+        flag = cv2.INTER_LINEAR if target_h > (real_bot - real_top) else cv2.INTER_AREA
+        stretched = cv2.resize(strip, (w, target_h), interpolation=flag)
+
+        # 如果 source 高度不够装下 chin + target_h 的内容，扩展画布
+        new_bot_y = chin_y + target_h
+        if new_bot_y > h:
+            out = np.zeros((new_bot_y, w, 4), dtype=source_bgra.dtype)
+            out[:h, :, :] = source_bgra
+        else:
+            out = source_bgra.copy()
+
+        # 把 chin → chin + target_h 之间的内容替换为拉伸的脖子段
+        out[chin_y:chin_y + target_h, :, :] = stretched
+        return out
+
+    def _apply_pink_noise_to_neck_band(
+        self, source_bgra: np.ndarray, source_face,
+    ) -> np.ndarray:
+        """
+        方案 E：在 source 的脖子段（chin → chin + neck_target_length × jaw_span）
+        BGR 上叠加 1/f pink noise，把拉伸丢失的高频毛孔细节补回来。
+        3 通道共享同一灰度 noise 但带轻微 RGB 色相波动 [0.95, 1.0, 1.05]，避免出彩虹色。
+        仅在 alpha>40 像素叠加，避免污染透明区。
+        """
+        h, w = source_bgra.shape[:2]
+        lm = source_face.landmark
+        chin_y = int(lm[self.LANDMARK_CHIN].y * h)
+        jl_x = lm[self.LANDMARK_LEFT_JAW].x * w
+        jl_y = lm[self.LANDMARK_LEFT_JAW].y * h
+        jr_x = lm[self.LANDMARK_RIGHT_JAW].x * w
+        jr_y = lm[self.LANDMARK_RIGHT_JAW].y * h
+        jaw_span = float(np.hypot(jl_x - jr_x, jl_y - jr_y))
+        if jaw_span < 12.0:
+            return source_bgra
+
+        band_top = chin_y
+        band_bot = min(chin_y + int(round(jaw_span * self.neck_target_length)), h)
+        region_h = band_bot - band_top
+        if region_h < 10 or w < 10:
+            return source_bgra
+
+        noise_gray = self._generate_pink_noise_2d(
+            region_h, w, sigma=self.NOISE_SIGMA, alpha=self.NOISE_ALPHA, seed=0,
+        )
+        if self.NOISE_BLUR_SIGMA > 0:
+            bk = max(3, int(round(self.NOISE_BLUR_SIGMA * 3.0)) | 1)
+            noise_gray = cv2.GaussianBlur(noise_gray, (bk, bk), self.NOISE_BLUR_SIGMA)
+        # 3 通道共享灰度 noise + 微弱 RGB 色相波动
+        noise_3c = np.stack(
+            [noise_gray * 0.95, noise_gray * 1.00, noise_gray * 1.05], axis=-1,
+        ).astype(np.float32)
+
+        out = source_bgra.copy()
+        region = out[band_top:band_bot, :, :].astype(np.float32)
+        am = (region[:, :, 3] > 40)[..., None].astype(np.float32)
+        region[:, :, :3] = region[:, :, :3] + noise_3c * am
+        region[:, :, :3] = np.clip(region[:, :, :3], 0, 255)
+        out[band_top:band_bot, :, :] = region.astype(np.uint8)
+        return out
+
+    # =================================================================================
+    # 核心方法 1：加脖子（affine warp 原图脖子像素到头像坐标系）
+    # =================================================================================
+
     def _add_neck(
         self,
         head_bgra: np.ndarray,
@@ -158,6 +319,7 @@ class MakeIDPhoto:
     ) -> np.ndarray:
         """
         在头像下方加真实脖子：
+          0. 根据 stretch_mode 预处理 source（"linear" 或 "noise" 拉伸真实脖子）
           1. 头像和原图各自检测的下颌三点构造 affine 变换
           2. 把原图整体 warp 到头像坐标系
           3. 构造梯形脖子 polygon，在 polygon 内**用 warped 像素覆盖头像 BGR**
@@ -165,6 +327,14 @@ class MakeIDPhoto:
 
         polygon 边缘用 AA mask 0-255 灰度做软过渡，无可见接缝。
         """
+        # 0. source 预处理：根据 stretch_mode 决定拉伸方案
+        if self.stretch_mode == self.STRETCH_MODE_LINEAR:
+            source_bgra = self._stretch_source_neck(source_bgra, source_face)
+        elif self.stretch_mode == self.STRETCH_MODE_NOISE:
+            source_bgra = self._stretch_source_neck(source_bgra, source_face)
+            source_bgra = self._apply_pink_noise_to_neck_band(source_bgra, source_face)
+        # STRETCH_MODE_NONE: 不动 source
+
         h, w = head_bgra.shape[:2]
         sH, sW = source_bgra.shape[:2]
 
@@ -579,6 +749,24 @@ def main(argv: Optional[list] = None) -> int:
         help=f"衣服 V 领 alpha 向上 dilate 像素数，默认 {MakeIDPhoto.CLOTHES_VNECK_DILATE_PX}。"
         ">0 让衣领布料向上扩展盖住脖子漏白（最针对漏白的参数）",
     )
+    parser.add_argument(
+        "--stretch-mode",
+        choices=[
+            MakeIDPhoto.STRETCH_MODE_NONE,
+            MakeIDPhoto.STRETCH_MODE_LINEAR,
+            MakeIDPhoto.STRETCH_MODE_NOISE,
+        ],
+        default=None,
+        help=f"source 脖子拉伸方案，默认 {MakeIDPhoto.DEFAULT_STRETCH_MODE!r}。"
+        "none=不拉伸（受原图脖子长度限制）；"
+        "linear=纵向 cv2.resize 拉伸真实脖子段；"
+        "noise=拉伸 + 1/f pink noise 补回毛孔细节（最真实）",
+    )
+    parser.add_argument(
+        "--neck-target-length", type=float, default=None,
+        help=f"拉伸后脖子总长度 / source_jaw_span，默认 {MakeIDPhoto.NECK_TARGET_LENGTH_FRAC}。"
+        "调大让脖子更长；建议 ≥ NECK_DEPTH_FRAC（{}）",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -592,6 +780,8 @@ def main(argv: Optional[list] = None) -> int:
             clothes_scale=args.clothes_scale,
             clothes_y_offset_ratio=args.clothes_y_offset,
             clothes_vneck_dilate_px=args.clothes_vneck_dilate,
+            stretch_mode=args.stretch_mode,
+            neck_target_length=args.neck_target_length,
         )
         return job.run()
     except Exception as e:
