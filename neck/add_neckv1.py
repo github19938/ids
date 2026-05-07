@@ -141,6 +141,132 @@ def sample_neck_anchor_skin_color(
 # 拉低 ref mean）。让 ref mean 尽量接近脸主体亮度，从而脖子色匹配真正的脸色而非下颌阴影色。
 NECK_REF_POOL_LANDMARKS: Tuple[int, ...] = (10, 205, 425, 280, 164)
 # 实测脸最亮 5 点：额中 / 双颊 / 右颊上 / 人中。去掉了 50/67/297 等被头发阴影污染的点。
+# 注：仅作 fallback；默认 add_fake_neck_v1 会调 gather_face_oval_skin_pixels 取整脸全像素。
+
+# Face oval 路径（方案 2）：缓存 polygon 顺序避免重复重建
+_FACE_OVAL_ORDERED_CACHE: Optional[List[int]] = None
+
+
+def _build_polygon_from_edges(
+    edges, lm, w: int, h: int
+) -> Optional[np.ndarray]:
+    """
+    从 mediapipe 的 FACEMESH_* edge set 构造闭合 polygon 的 (N, 2) 像素坐标。
+    edge set 是 (start, end) 集合，可能多组无序，返回单一闭环（最大连通分量）。
+    """
+    if not edges:
+        return None
+    g: dict = {}
+    for a, b in edges:
+        g.setdefault(a, set()).add(b)
+        g.setdefault(b, set()).add(a)
+    # 找一个起点，沿邻接走环
+    start = min(g.keys())
+    visited = {start}
+    order = [start]
+    cur = start
+    while True:
+        nxts = [n for n in g[cur] if n not in visited]
+        if not nxts:
+            break
+        # 走能延续环的下一点（任意取一个邻居即可）
+        nx = nxts[0]
+        visited.add(nx)
+        order.append(nx)
+        cur = nx
+    if len(order) < 3:
+        return None
+    pts = np.array([landmark_xy(lm[i], w, h) for i in order], dtype=np.float64)
+    return pts
+
+
+FACE_OVAL_BRIGHTEST_FRAC = 0.40
+# 整脸 mean 包含 oval 边缘的鬓角/颌底等偏暗像素 → 与 5-landmark 选最亮点比反而暗。
+# 改取整脸最亮 40% 像素的 mean 作 ref：
+#   - 仍保留大样本（30k 中取 12k）的统计稳定性，
+#   - 又自动避开鬓角/颌底/局部阴影，对齐脸亮区。
+
+
+def gather_face_oval_skin_pixels(
+    bgra: np.ndarray,
+    landmarks,
+    h: int,
+    w: int,
+    brightest_frac: float = FACE_OVAL_BRIGHTEST_FRAC,
+) -> np.ndarray:
+    """
+    **方案 2（CPU 纯算法路径优化）**：从整张脸的「最亮 brightest_frac」肤色像素采样，
+    作为 Reinhard tone-match 的 ref pool。
+
+    步骤：
+      1. 用 ``FACEMESH_FACE_OVAL`` 构造闭合 polygon mask（脸轮廓内部）
+      2. 减去 ``FACEMESH_LEFT_EYE / RIGHT_EYE / LIPS / LEFT_EYEBROW /
+         RIGHT_EYEBROW / NOSE`` 各自 polygon
+      3. 与 alpha>40 ∩ YCrCb 肤色范围相交
+      4. 按 luminance（Rec.601 灰度）排序，取最亮 ``brightest_frac`` (默认 40%)
+      5. 返回该子集像素 (N, 3)
+
+    样本量从原 (5 landmarks patches) ≈ ~1000 px 提升到 ~12,000-20,000 px，
+    mean 估计标准误降 ~4×；同时通过亮度过滤避开鬓角/颌底/局部阴影，
+    比"5-landmark 手挑亮点"更不依赖 landmark 选位。
+    """
+    try:
+        import mediapipe as _mp
+    except ImportError:
+        return np.empty((0, 3), dtype=np.uint8)
+    fm = _mp.solutions.face_mesh
+    lm = landmarks.landmark
+
+    oval_pts = _build_polygon_from_edges(fm.FACEMESH_FACE_OVAL, lm, w, h)
+    if oval_pts is None:
+        return np.empty((0, 3), dtype=np.uint8)
+
+    oval_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(oval_mask, [np.round(oval_pts).astype(np.int32).reshape(1, -1, 2)], 255)
+
+    # 减去眼/眉/嘴/鼻
+    feature_attrs = (
+        "FACEMESH_LEFT_EYE", "FACEMESH_RIGHT_EYE", "FACEMESH_LIPS",
+        "FACEMESH_LEFT_EYEBROW", "FACEMESH_RIGHT_EYEBROW", "FACEMESH_NOSE",
+    )
+    for attr in feature_attrs:
+        edges = getattr(fm, attr, None)
+        if edges is None:
+            continue
+        feat_pts = _build_polygon_from_edges(edges, lm, w, h)
+        if feat_pts is None or feat_pts.shape[0] < 3:
+            continue
+        cv2.fillPoly(
+            oval_mask,
+            [np.round(feat_pts).astype(np.int32).reshape(1, -1, 2)],
+            0,
+        )
+
+    # 与 alpha & YCrCb 肤色相交
+    am = bgra[:, :, 3] > 40
+    ycrcb = cv2.cvtColor(bgra[:, :, :3], cv2.COLOR_BGR2YCrCb)
+    cr = ycrcb[:, :, 1]; cb = ycrcb[:, :, 2]
+    skin = (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127)
+    final = (oval_mask > 0) & am & skin
+    if not np.any(final):
+        return np.empty((0, 3), dtype=np.uint8)
+    pixels = bgra[:, :, :3][final]
+    if pixels.shape[0] < 100:
+        return pixels
+    # 取最亮 brightest_frac 子集（避开鬓角/颌底/局部阴影）
+    frac = float(np.clip(brightest_frac, 0.05, 1.0))
+    if frac < 0.999:
+        # Rec.601 luminance: 0.114*B + 0.587*G + 0.299*R
+        lum = (
+            0.114 * pixels[:, 0].astype(np.float32)
+            + 0.587 * pixels[:, 1].astype(np.float32)
+            + 0.299 * pixels[:, 2].astype(np.float32)
+        )
+        thr = float(np.quantile(lum, 1.0 - frac))
+        keep = lum >= thr
+        if int(np.sum(keep)) >= 100:
+            pixels = pixels[keep]
+    return pixels
 
 
 def _gather_neck_ref_pixels(
@@ -1146,9 +1272,13 @@ def realism_pipeline(
     # ---------- Phase E: 颜色迁移（默认 Reinhard mean shift）-----------------------------
     # 关键：Pitié 会把 detail noise 的 std 替换成 ref 的低 std，导致毛孔纹理被抹掉
     # （std 从 12 降到 3）。改用 Reinhard mean shift——只动 mean、保留 std，detail 完整透过。
-    # ref pool 用颊主导（NECK_REF_POOL_LANDMARKS），让目标色对齐脸主体而非颌下阴影。
+    # 方案 2: ref pool 优先用 face oval 整脸全像素（~30-50k px），mean 估计标准误降 ~7×；
+    #         失败回退到 _gather_neck_ref_pixels（5-landmark 小样本）。
     if enable_pitie:
-        ref_pixels = _gather_neck_ref_pixels(bgra, landmarks, h, w)
+        ref_pixels = gather_face_oval_skin_pixels(bgra, landmarks, h, w)
+        if ref_pixels.shape[0] < 200:
+            # face oval 路径失败 / 像素过少（如脸太小、被遮挡），fallback 到 5-landmark
+            ref_pixels = _gather_neck_ref_pixels(bgra, landmarks, h, w)
         pitie_mask = refined_alpha > 0.05
         _reinhard_mean_shift_inplace(
             blended_bgra, pitie_mask, ref_pixels, strength=pitie_strength,
