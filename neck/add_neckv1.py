@@ -390,8 +390,13 @@ def _gather_neck_ref_pixels(
 # 下巴过渡区采样：取下巴线正上方的窄条肤色像素，作为脖子顶部需要直接衔接的颜色参考。
 CHIN_STRIP_HEIGHT_FRAC = 0.08   # 窄条高度 = jaw_span × 8%
 CHIN_STRIP_WIDTH_FRAC = 0.70    # 窄条宽度 = jaw_span × 70%（居中，避开两侧颌角阴影）
-CHIN_STRIP_LANDMARKS = (152, 377, 148, 377, 150, 152, 200, 164)
-# 主要取下巴底部 landmark 152(chin tip) 及其附近点，居中采样
+CHIN_STRIP_REF_WEIGHT = 0.15    # 在 ref pool 中所占的比例（之前 50% 让脖子整体偏暗 12 单位）
+
+# 原图脖子区域采样（source_image 路径）：在 chin 下方提取真实肤色像素作 ref
+SOURCE_NECK_Y_START_FRAC = 0.10   # 起始 y = chin_y + jaw_span × 0.10（避开 chin AA 边界）
+SOURCE_NECK_Y_END_FRAC = 0.55     # 结束 y = chin_y + jaw_span × 0.55（避开衣领）
+SOURCE_NECK_HALF_WIDTH_FRAC = 0.20  # 横向 ±jaw_span × 0.20
+SOURCE_NECK_MIN_PIXELS = 200      # 至少 200 个肤色像素才认为"原图有脖子"
 
 
 def gather_chin_strip_skin_pixels(
@@ -436,6 +441,84 @@ def gather_chin_strip_skin_pixels(
         valid = am
     if not np.any(valid):
         return np.empty((0, 3), dtype=np.uint8)
+
+    return roi[:, :, :3][valid]
+
+
+def gather_source_neck_skin_pixels(
+    source_image_path: Optional[str],
+) -> Optional[np.ndarray]:
+    """
+    从「原图」（带真实脖子的完整人像，可以是 RGB JPG / PNG / RGBA PNG）的脖子区域
+    提取真实肤色像素作为 ground-truth ref pool。
+
+    流程：
+      1. imread 加载原图（支持中文路径），无 alpha 时自动加 alpha=255
+      2. 在原图上跑 FaceMesh 检测人脸（不依赖 head.png 的检测结果，因为是另一张图）
+      3. 取 chin 下方 [+10% jaw_span, +55% jaw_span] × ±20% jaw_span 的矩形 ROI
+         （避开 chin AA 边界 + 避开衣领）
+      4. alpha>40 ∩ YCrCb 肤色范围过滤
+      5. 至少 SOURCE_NECK_MIN_PIXELS=200 个肤色像素才认为"原图有脖子"
+
+    返回：
+      - (N, 3) BGR uint8：原图脖子真实肤色像素池，N ≥ 200
+      - None：source_image_path 为空 / 文件不存在 / 无人脸 / 脖子区域无足够肤色
+    """
+    if source_image_path is None or not source_image_path:
+        return None
+    try:
+        from neck.add_neck import imread_unicode
+    except ImportError:
+        from add_neck import imread_unicode
+
+    try:
+        src = imread_unicode(source_image_path)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if src is None or src.ndim != 3:
+        return None
+    if src.shape[2] == 3:
+        src = cv2.cvtColor(src, cv2.COLOR_BGR2BGRA)
+        src[:, :, 3] = 255
+    elif src.shape[2] != 4:
+        return None
+
+    sH, sW = src.shape[:2]
+    src_rgb = cv2.cvtColor(src[:, :, :3], cv2.COLOR_BGR2RGB)
+
+    src_landmarks = detect_face_with_retry(src_rgb)
+    if src_landmarks is None:
+        return None
+
+    lm = src_landmarks.landmark
+    chin_x = float(lm[152].x * sW)
+    chin_y = float(lm[152].y * sH)
+    jaw_l = (lm[172].x * sW, lm[172].y * sH)
+    jaw_r = (lm[397].x * sW, lm[397].y * sH)
+    jaw_span = float(np.hypot(jaw_l[0] - jaw_r[0], jaw_l[1] - jaw_r[1]))
+    if jaw_span < 12.0:
+        return None
+
+    # 脖子 ROI: chin 下方一段 + 中央 ±0.2 jaw_span 宽
+    y_start = int(np.clip(chin_y + jaw_span * SOURCE_NECK_Y_START_FRAC, 0, sH))
+    y_end = int(np.clip(chin_y + jaw_span * SOURCE_NECK_Y_END_FRAC, 0, sH))
+    half_w = int(jaw_span * SOURCE_NECK_HALF_WIDTH_FRAC)
+    x_start = int(np.clip(chin_x - half_w, 0, sW))
+    x_end = int(np.clip(chin_x + half_w, 0, sW))
+    if y_end <= y_start + 5 or x_end <= x_start + 5:
+        return None
+
+    roi = src[y_start:y_end, x_start:x_end]
+    am = roi[:, :, 3] > 40
+    ycrcb = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2YCrCb)
+    cr = ycrcb[:, :, 1]
+    cb = ycrcb[:, :, 2]
+    skin = (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127)
+    valid = am & skin
+
+    n_skin = int(np.sum(valid))
+    if n_skin < SOURCE_NECK_MIN_PIXELS:
+        return None
 
     return roi[:, :, :3][valid]
 
@@ -1190,6 +1273,7 @@ def realism_pipeline(
     laplacian_levels: int = LAPLACIAN_LEVELS_DEFAULT,
     rng_seed: int = QUILT_RNG_SEED,
     quilt_method: str = "tile",
+    source_neck_pixels: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, V1DebugInfo]:
     """
     Phase A 之"真实感主流程"：在 procedural 层之上跑 B/C/D/E。
@@ -1280,33 +1364,44 @@ def realism_pipeline(
         k = odd_kernel(int(round(sigma * 3.0)) + 1)
         refined_alpha = (cv2.GaussianBlur(polygon_mask_u8.astype(np.float32), (k, k), sigma) / 255.0).astype(np.float64)
 
-    # ---------- Phase E: 颜色迁移（下巴过渡区 + 脸部整体混合参考 + alpha 加权）---------
+    # ---------- Phase E: 颜色迁移 ----------------------------------------------------
+    # 优先级：
+    #   1. 若 source_neck_pixels 非空（用户提供原图且检测到脖子）→ **严格按原图脖子色**
+    #      作 ref pool（不混合 chin/oval）
+    #   2. 否则走「下巴过渡区 + 脸部 oval 最亮 40%」混合（chin 仅 15% 权重，避免拉暗）
     ref_pixels = np.empty((0, 3), dtype=np.uint8)
+    ref_source = "none"
     if enable_pitie:
-        # 参考像素：50% 下巴过渡区 + 50% 脸部整体，保证接缝处颜色连续
-        chin_pixels = gather_chin_strip_skin_pixels(bgra, landmarks, h, w, jaw_span)
-        oval_pixels = gather_face_oval_skin_pixels(bgra, landmarks, h, w)
-        if chin_pixels.shape[0] >= 200 and oval_pixels.shape[0] >= 200:
-            # 各取一半，按数量等比抽样
-            n_chin = chin_pixels.shape[0]
-            n_oval = oval_pixels.shape[0]
-            target_chin = min(n_chin, max(n_oval, 200))
-            target_oval = min(n_oval, max(n_chin, 200))
-            rng_ref = np.random.default_rng(42)
-            if n_chin > target_chin:
-                idx = rng_ref.choice(n_chin, target_chin, replace=False)
-                chin_pixels = chin_pixels[idx]
-            if n_oval > target_oval:
-                idx = rng_ref.choice(n_oval, target_oval, replace=False)
-                oval_pixels = oval_pixels[idx]
-            ref_pixels = np.vstack([chin_pixels, oval_pixels])
-        elif oval_pixels.shape[0] >= 8:
-            ref_pixels = oval_pixels
+        if source_neck_pixels is not None and source_neck_pixels.shape[0] >= SOURCE_NECK_MIN_PIXELS:
+            # 路径 1：原图有脖子，严格用原图脖子色
+            ref_pixels = source_neck_pixels
+            ref_source = "source_image_neck"
         else:
-            ref_pixels = _gather_neck_ref_pixels(bgra, landmarks, h, w)
+            # 路径 2：原图没提供 / 没检测到脖子 → 走 chin strip + oval 混合
+            # 修复 1: chin strip 权重从 50% 降到 15%（之前实测让 ref 偏暗 17 单位 R）
+            chin_pixels = gather_chin_strip_skin_pixels(bgra, landmarks, h, w, jaw_span)
+            oval_pixels = gather_face_oval_skin_pixels(bgra, landmarks, h, w)
+            if chin_pixels.shape[0] >= 200 and oval_pixels.shape[0] >= 200:
+                # chin 占 CHIN_STRIP_REF_WEIGHT (15%)，oval 占 (85%)
+                n_oval = oval_pixels.shape[0]
+                target_oval = n_oval
+                target_chin = max(int(round(n_oval * CHIN_STRIP_REF_WEIGHT / (1.0 - CHIN_STRIP_REF_WEIGHT))), 200)
+                target_chin = min(target_chin, chin_pixels.shape[0])
+                rng_ref = np.random.default_rng(42)
+                if chin_pixels.shape[0] > target_chin:
+                    idx = rng_ref.choice(chin_pixels.shape[0], target_chin, replace=False)
+                    chin_pixels = chin_pixels[idx]
+                ref_pixels = np.vstack([chin_pixels, oval_pixels])
+                ref_source = "chin15_oval85"
+            elif oval_pixels.shape[0] >= 8:
+                ref_pixels = oval_pixels
+                ref_source = "oval_only"
+            else:
+                ref_pixels = _gather_neck_ref_pixels(bgra, landmarks, h, w)
+                ref_source = "5_landmark_fallback"
 
         if ref_pixels.shape[0] >= 8:
-            pitie_mask = polygon_mask_u8 >= 1  # 基础工作掩码
+            pitie_mask = polygon_mask_u8 >= 1
             _apply_L_meanshift_ab_cdf_inplace(
                 blended_bgra, pitie_mask, ref_pixels,
                 strength=pitie_strength, alpha_map=refined_alpha,
@@ -1390,6 +1485,7 @@ def add_fake_neck_v1(
     flat_shading: bool = True,                # True=不画圆柱 lit/shadow, 适合 portrait/无衣领
     cylinder_strength: float = 0.30,          # flat_shading=False 时圆柱明暗强度系数
     neck_depth_frac: float = 1.4,             # neck_depth = jaw_span * neck_depth_frac（1.85→1.4 更短）
+    source_image_path: Optional[str] = None,  # 原图（带真实脖子）路径；非空且检测到脖子 → 严格按原图脖子色
     laplacian_levels: int = LAPLACIAN_LEVELS_DEFAULT,
     rng_seed: int = QUILT_RNG_SEED,
     face_mesh: Optional[object] = None,
@@ -1468,6 +1564,9 @@ def add_fake_neck_v1(
         cylinder_strength=cylinder_strength,
     )
 
+    # 若提供了原图路径，尝试从中提取真实脖子肤色像素（None = 未提供 / 未检测到脖子）
+    source_neck_pixels = gather_source_neck_skin_pixels(source_image_path)
+
     final_layer, info = realism_pipeline(
         bgra, landmarks, proc_layer, mask_u8, poly, jaw_span,
         enable_quilt=enable_quilt,
@@ -1479,6 +1578,7 @@ def add_fake_neck_v1(
         laplacian_levels=laplacian_levels,
         rng_seed=rng_seed,
         quilt_method=quilt_method,
+        source_neck_pixels=source_neck_pixels,
     )
     info = info._replace(pose=(yaw, pitch, roll))
 
@@ -1533,6 +1633,11 @@ def main(argv: Optional[list] = None) -> int:
     )
     parser.set_defaults(enable_stubble=True)
     parser.add_argument(
+        "--source-image", default=None,
+        help="原图路径（同一人的完整人像，带真实脖子）；提供后**严格按原图脖子肤色**渲染；"
+        "为空 / 检测不到脖子时走默认 chin+oval 混合 ref 路径",
+    )
+    parser.add_argument(
         "--quilt-method", choices=["noise", "tile", "patchquilt"], default="noise",
         help="纹理方法：noise（默认，1/f pink noise，无脸结构污染）/ tile（镜像平铺）/ patchquilt（旧）",
     )
@@ -1578,6 +1683,7 @@ def main(argv: Optional[list] = None) -> int:
             flat_shading=args.flat_shading,
             cylinder_strength=args.cylinder_strength,
             enable_stubble=args.enable_stubble,
+            source_image_path=args.source_image,
         )
     except Exception as e:
         print(f"[错误] {e}", file=sys.stderr)
