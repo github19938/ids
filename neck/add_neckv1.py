@@ -137,6 +137,96 @@ def sample_neck_anchor_skin_color(
     return _apply_neck_skin_tone(raw, skin_v_scale, skin_h_shift, skin_s_scale)
 
 
+# 方案 5：胡茬检测 + 颌下暗调
+# 实测 imagev2 chin+15% R=224 比 chin+50% R=240 暗 16 单位——这就是胡茬投影。
+# 我们当前 procedural 只有 -8% 的 AO，缺这个色调偏移。
+# 检测：比较下巴上(200) 与双颊(205, 425) 的 V 通道差。颊比下巴亮 → 有胡茬阴影。
+STUBBLE_DETECT_LANDMARK_CHIN = 200          # 下巴上（胡茬区中心）
+STUBBLE_DETECT_LANDMARKS_CHEEK = (205, 425) # 双颊（无胡茬区）
+STUBBLE_DETECT_PATCH_PX = 14
+STUBBLE_DETECT_THRESHOLD = 4.0              # V 差 > 4 视为有胡茬
+STUBBLE_DETECT_FULL_RANGE = 24.0            # V 差 ≥ 24 → 强度 1.0
+STUBBLE_TOP_BAND_FRAC = 0.40                # 暗调影响脖子顶端 40% 区域
+STUBBLE_DECAY_FRAC = 0.13                   # 颌线距离指数衰减（小=暗调集中在顶端不外溢）
+STUBBLE_INTENSITY_MAX = 32.0                # max BGR 减量（强度=1时）
+STUBBLE_NOISE_SIGMA = 3.0                   # 胡茬区随机斑点 sigma（让阴影不均匀）
+
+
+def _stubble_patch_v(bgra, lid, lm, h, w):
+    cx, cy = landmark_xy(lm[lid], w, h)
+    x0, y0, pw, ph = skin_patch_rect_at(cx, cy, h, w, STUBBLE_DETECT_PATCH_PX)
+    if pw <= 0 or ph <= 0:
+        return None
+    roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
+    am = roi[:, :, 3] > 40
+    if not am.any():
+        return None
+    hsv = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2HSV)
+    return float(hsv[:, :, 2][am].mean())
+
+
+def detect_stubble_strength(bgra: np.ndarray, landmarks, h: int, w: int) -> float:
+    """
+    估计胡茬阴影强度（0~1）。
+    比较下巴上（lid 200，胡茬区中心）与双颊（lid 205/425，无胡茬区）的 V 通道差：
+    颊比下巴亮 N 单位 → strength = clip((N - 4) / 20, 0, 1)。
+    """
+    lm = landmarks.landmark
+    v_chin = _stubble_patch_v(bgra, STUBBLE_DETECT_LANDMARK_CHIN, lm, h, w)
+    v_cheek_vals = []
+    for lid in STUBBLE_DETECT_LANDMARKS_CHEEK:
+        v = _stubble_patch_v(bgra, lid, lm, h, w)
+        if v is not None:
+            v_cheek_vals.append(v)
+    if v_chin is None or not v_cheek_vals:
+        return 0.0
+    v_cheek = float(np.mean(v_cheek_vals))
+    diff = v_cheek - v_chin   # 颊亮于下巴的程度
+    if diff < STUBBLE_DETECT_THRESHOLD:
+        return 0.0
+    return float(np.clip(
+        (diff - STUBBLE_DETECT_THRESHOLD) / (STUBBLE_DETECT_FULL_RANGE - STUBBLE_DETECT_THRESHOLD),
+        0.0, 1.0,
+    ))
+
+
+def apply_stubble_shadow_inplace(
+    layer_bgra: np.ndarray,
+    polygon_mask_u8: np.ndarray,
+    poly: np.ndarray,
+    jaw_span: float,
+    strength: float,
+    rng_seed: int = 12345,
+) -> None:
+    """
+    在脖子顶端区域（chin 接缝处）叠加暗调，模拟胡茬投影。
+    暗调强度沿 chin 折线距离指数衰减：颌下最深，向下渐隐。
+    叠加微弱噪声让阴影不均匀（更像真实胡茬）。
+    """
+    if strength <= 0.01:
+        return
+    h, w = polygon_mask_u8.shape
+    n_up = max(poly.shape[0] // 2, 2)
+    upper = poly[:n_up].astype(np.float64)
+    dt_top = distance_map_to_polyline(h, w, upper)
+    depth = max(float(np.max(poly[:, 1]) - np.min(poly[:, 1])), 1.0)
+    tau = max(depth * STUBBLE_DECAY_FRAC, 6.0)
+    decay = np.exp(-dt_top / tau)
+    decay = decay.astype(np.float32)
+
+    # 微弱噪声让暗调不均匀
+    rng = np.random.default_rng(rng_seed + 1)
+    noise = rng.standard_normal((h, w)).astype(np.float32) * STUBBLE_NOISE_SIGMA
+    noise = cv2.GaussianBlur(noise, (5, 5), 1.0)
+
+    mask_bool = polygon_mask_u8 >= 1
+    intensity = (decay * (STUBBLE_INTENSITY_MAX * float(strength)) + noise * float(strength))
+    intensity = np.clip(intensity, 0.0, 32.0)
+    bgr = layer_bgra[:, :, :3].astype(np.float32)
+    bgr -= intensity[..., None] * mask_bool[..., None].astype(np.float32)
+    layer_bgra[:, :, :3] = np.clip(bgr, 0, 255).astype(np.uint8)
+
+
 # Reinhard tone-match 的 ref pool 用「双颊主导 + 人中」，**不含下巴**（下巴常处于阴影会
 # 拉低 ref mean）。让 ref mean 尽量接近脸主体亮度，从而脖子色匹配真正的脸色而非下颌阴影色。
 NECK_REF_POOL_LANDMARKS: Tuple[int, ...] = (10, 205, 425, 280, 164)
@@ -1227,6 +1317,7 @@ def realism_pipeline(
     enable_matting: bool = True,
     enable_lap_blend: bool = True,
     enable_pitie: bool = True,
+    enable_stubble: bool = True,
     pitie_strength: float = 0.6,
     laplacian_levels: int = LAPLACIAN_LEVELS_DEFAULT,
     rng_seed: int = QUILT_RNG_SEED,
@@ -1320,10 +1411,6 @@ def realism_pipeline(
         refined_alpha = (cv2.GaussianBlur(polygon_mask_u8.astype(np.float32), (k, k), sigma) / 255.0).astype(np.float64)
 
     # ---------- Phase E: 颜色迁移（方案 2 ref pool + 方案 4 分通道处理）---------------
-    # 方案 2: ref pool 优先用 face oval 整脸最亮 40%（~14k px），mean 估计标准误降 ~4×；
-    #         失败回退到 _gather_neck_ref_pixels（5-landmark 小样本）。
-    # 方案 4: L 通道 mean shift（保留 detail noise）+ a/b 通道 CDF match（迁移色相分布
-    #         的形状，不是只动均值），比单一 Reinhard mean shift 更精细。
     if enable_pitie:
         ref_pixels = gather_face_oval_skin_pixels(bgra, landmarks, h, w)
         if ref_pixels.shape[0] < 200:
@@ -1332,6 +1419,17 @@ def realism_pipeline(
         _apply_L_meanshift_ab_cdf_inplace(
             blended_bgra, pitie_mask, ref_pixels, strength=pitie_strength,
         )
+
+    # ---------- 方案 5: 胡茬检测 + 颌下暗调叠加 -------------------------------------
+    # 检测脸是否有胡茬（下巴上 V < 颊 V 多少），若 strength>0 则在脖子顶端区域叠加
+    # 衰减暗调（带微弱噪声让阴影不均匀），模拟胡茬向脖子的投影。
+    if enable_stubble:
+        stubble_strength = detect_stubble_strength(bgra, landmarks, h, w)
+        if stubble_strength > 0.01:
+            apply_stubble_shadow_inplace(
+                blended_bgra, polygon_mask_u8, poly, jaw_span,
+                strength=stubble_strength, rng_seed=rng_seed,
+            )
 
     # 应用 alpha 抑制（仅在脸部不透明区域 + 距上沿近的 pixels 抑制脖子 alpha）
     n_up = max(poly.shape[0] // 2, 2)
@@ -1394,6 +1492,7 @@ def add_fake_neck_v1(
     enable_matting: bool = True,
     enable_lap_blend: bool = True,
     enable_pitie: bool = True,
+    enable_stubble: bool = True,              # 方案 5：检测胡茬 + 颌下暗调
     pitie_strength: float = 1.0,              # 1.0：完全对齐脸部下半部分均值（实测匹配 imagev2）
     quilt_method: str = "noise",              # "noise"(默认)=1/f pink noise; "tile"=镜像平铺; "patchquilt"=旧 quilting
     flat_shading: bool = True,                # True=不画圆柱 lit/shadow, 适合 portrait/无衣领
@@ -1483,6 +1582,7 @@ def add_fake_neck_v1(
         enable_matting=enable_matting,
         enable_lap_blend=enable_lap_blend,
         enable_pitie=enable_pitie,
+        enable_stubble=enable_stubble,
         pitie_strength=pitie_strength,
         laplacian_levels=laplacian_levels,
         rng_seed=rng_seed,
@@ -1536,6 +1636,11 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--no-pose-correction", dest="pose_correction", action="store_false")
     parser.add_argument("--no-auto-scale", dest="auto_scale_by_jaw", action="store_false")
     parser.add_argument(
+        "--no-stubble", dest="enable_stubble", action="store_false",
+        help="禁用胡茬检测 + 颌下暗调（默认开；女性头像无影响因为检测不出胡茬）",
+    )
+    parser.set_defaults(enable_stubble=True)
+    parser.add_argument(
         "--quilt-method", choices=["noise", "tile", "patchquilt"], default="noise",
         help="纹理方法：noise（默认，1/f pink noise，无脸结构污染）/ tile（镜像平铺）/ patchquilt（旧）",
     )
@@ -1580,6 +1685,7 @@ def main(argv: Optional[list] = None) -> int:
             quilt_method=args.quilt_method,
             flat_shading=args.flat_shading,
             cylinder_strength=args.cylinder_strength,
+            enable_stubble=args.enable_stubble,
         )
     except Exception as e:
         print(f"[错误] {e}", file=sys.stderr)
