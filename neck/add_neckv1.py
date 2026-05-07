@@ -2,20 +2,21 @@
 """
 add_neckv1.py
 =============
-真实感重构版本（Phase A + B + C + D + E 全做完，独立于 add_neck.py 不影响其行为）。
+真实感重构版本（Phase A + B + C + D + E，独立于 add_neck.py 不影响其行为）。
 
 设计要点：
   - **不删旧代码**：``add_neck.py`` 完整保留作为 fallback；本文件复用其几何/光照/姿态/估光等
     底层助手，并在它生成的"过程化先验"上跑：
-  - **Phase B（核心方案换）** 从用户脸部真实皮肤采 patch，用 image quilting + min-cut seam
-    拼到脖子区域。脖子的纹理像素本质上**就是这张图脸上的肤色**，毛孔/淡疤/油光都是真的。
-  - **Phase C（方案换）** 用 ``pymatting`` closed-form alpha matting 在 chin 弧线区域
+  - **Phase B（纹理迁移）** 三种可选方案：
+      - ``noise``（默认）：1/f pink noise，频谱近似皮肤毛孔，无脸结构污染。
+      - ``tile``：从脸颊取单块肤色 ROI 镜像平铺，保留真实毛孔但可能有微弱对称感。
+      - ``patchquilt``：Efros-Freeman image quilting + min-cut seam 拼接（旧方案，对平滑皮肤接缝可见）。
+  - **Phase C（边缘羽化）** 用 ``pymatting`` closed-form alpha matting 在 chin 弧线区域
     解 ``I = α·F + (1-α)·B``，得到结构感知的 sub-pixel alpha，替代旧的 GaussianBlur 羽化。
-  - **Phase D（新增模块）** Laplacian 金字塔多频段融合：
-      低频（光影/AO/SCM）从过程化层取，高频（真实毛孔/纹理）从 quilted 层取，
-      合成一张「光影对、纹理真」的脖子。等价于 Poisson seam fix 但更稳定可控。
-  - **Phase E（方案换）** Pitié N-D PDF transfer 替代 Reinhard mean shift，对 3D Lab
-    联合分布做整形迁移而不是只动均值；带 sub-sampling + LUT bake 优化，CPU 实测 ~30 ms。
+  - **Phase D（纹理叠加）** 将高频 detail（毛孔纹理）叠加到过程化层（光影正确）之上：
+      low-freq（光影/AO）← procedural，high-freq（毛孔）← quilted/noise。
+  - **Phase E（颜色迁移）** 分通道 Lab 处理：L 通道 mean shift（保留 detail std），
+      a/b 通道 1D CDF match（色相分布形状完整迁移）。
   - **Phase A（重构）** ``procedural_neck_init`` + ``realism_pipeline`` 两段拆分，
     每个 Phase 都可独立开关 + 自带 fallback。
 
@@ -223,7 +224,9 @@ def apply_stubble_shadow_inplace(
     intensity = (decay * (STUBBLE_INTENSITY_MAX * float(strength)) + noise * float(strength))
     intensity = np.clip(intensity, 0.0, 32.0)
     bgr = layer_bgra[:, :, :3].astype(np.float32)
-    bgr -= intensity[..., None] * mask_bool[..., None].astype(np.float32)
+    # 非等量减：B 多减 5%，R 少减 5%，模拟真实胡茬阴影的微暖色调
+    stubble_tint = np.array([1.05, 1.0, 0.95], dtype=np.float32)  # BGR tint
+    bgr -= intensity[..., None] * stubble_tint * mask_bool[..., None].astype(np.float32)
     layer_bgra[:, :, :3] = np.clip(bgr, 0, 255).astype(np.uint8)
 
 
@@ -232,9 +235,6 @@ def apply_stubble_shadow_inplace(
 NECK_REF_POOL_LANDMARKS: Tuple[int, ...] = (10, 205, 425, 280, 164)
 # 实测脸最亮 5 点：额中 / 双颊 / 右颊上 / 人中。去掉了 50/67/297 等被头发阴影污染的点。
 # 注：仅作 fallback；默认 add_fake_neck_v1 会调 gather_face_oval_skin_pixels 取整脸全像素。
-
-# Face oval 路径（方案 2）：缓存 polygon 顺序避免重复重建
-_FACE_OVAL_ORDERED_CACHE: Optional[List[int]] = None
 
 
 def _build_polygon_from_edges(
@@ -387,6 +387,59 @@ def _gather_neck_ref_pixels(
     return np.vstack(chunks)
 
 
+# 下巴过渡区采样：取下巴线正上方的窄条肤色像素，作为脖子顶部需要直接衔接的颜色参考。
+CHIN_STRIP_HEIGHT_FRAC = 0.08   # 窄条高度 = jaw_span × 8%
+CHIN_STRIP_WIDTH_FRAC = 0.70    # 窄条宽度 = jaw_span × 70%（居中，避开两侧颌角阴影）
+CHIN_STRIP_LANDMARKS = (152, 377, 148, 377, 150, 152, 200, 164)
+# 主要取下巴底部 landmark 152(chin tip) 及其附近点，居中采样
+
+
+def gather_chin_strip_skin_pixels(
+    bgra: np.ndarray,
+    landmarks,
+    h: int,
+    w: int,
+    jaw_span: float,
+) -> np.ndarray:
+    """
+    在下巴线正上方取一条窄带肤色像素。这是脖子顶部需要直接衔接的区域——
+    颜色迁移的参考如果只用脸部最亮像素，脖子会比下巴过渡区偏亮，形成亮带。
+
+    窄带定义：以下巴尖 (landmark 152) 为中心，高度 = jaw_span × 8%，
+    宽度 = jaw_span × 70%，只取 YCrCb 肤色 + alpha>40 的像素。
+
+    返回 (N, 3) BGR uint8。
+    """
+    lm = landmarks.landmark
+    strip_h = max(int(round(jaw_span * CHIN_STRIP_HEIGHT_FRAC)), 4)
+    strip_w = max(int(round(jaw_span * CHIN_STRIP_WIDTH_FRAC)), 8)
+
+    # 以下巴尖为中心
+    chin_x, chin_y = landmark_xy(lm[152], w, h)
+    x0 = int(np.clip(chin_x - strip_w // 2, 0, w - 1))
+    y0 = int(np.clip(chin_y - strip_h, 0, h - 1))  # 正上方
+    x1 = int(np.clip(x0 + strip_w, 0, w))
+    y1 = int(np.clip(y0 + strip_h, 0, h))
+
+    roi = bgra[y0:y1, x0:x1]
+    if roi.size == 0:
+        return np.empty((0, 3), dtype=np.uint8)
+
+    am = roi[:, :, 3] > 40
+    ycrcb = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2YCrCb)
+    cr = ycrcb[:, :, 1]; cb = ycrcb[:, :, 2]
+    skin = (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127)
+    valid = am & skin
+
+    if not np.any(valid):
+        # fallback：放宽到 alpha>40 即可
+        valid = am
+    if not np.any(valid):
+        return np.empty((0, 3), dtype=np.uint8)
+
+    return roi[:, :, :3][valid]
+
+
 # =====================================================================================
 # Phase B: Image Quilting （从脸部真实皮肤拼接到脖子区域）
 # =====================================================================================
@@ -416,6 +469,56 @@ QUILT_RNG_SEED = 12345
 PINK_NOISE_SIGMA = 4.5                    # imagev2 实测高频 std≈1，对应 sigma≈4-5
 PINK_NOISE_ALPHA = 0.3                    # 1/f^0.3 接近白噪声，能量集中在高频（细毛孔）
 PINK_NOISE_BLUR_SIGMA = 1.3               # 1.3px 让噪点细腻不显砂砾
+
+
+def _compute_noise_bgr_scale(
+    bgra: np.ndarray,
+    landmarks,
+    h: int,
+    w: int,
+) -> np.ndarray:
+    """
+    从脸部锚定肤色 Lab a 通道自适应计算 pink noise 的 BGR 通道比例。
+    返回 (3,) float32，[B_scale, G_scale, R_scale]，中心=1.0。
+
+    - a_ref > 0（暖肤色，红润）：R 偏强、B 偏弱
+    - a_ref < 0（冷肤色，偏绿/蓝）：B 偏强、R 偏弱
+    - a_ref ≈ 0（中性）：三通道等比
+
+    比例幅度 = clip(|a_ref| / 10, 0.01, 0.08)，自动缩放。
+    """
+    try:
+        from neck.add_neck import median_bgr_in_patch
+    except ImportError:
+        from add_neck import median_bgr_in_patch
+
+    lm = landmarks.landmark
+    # 取双颊 (205, 425) 的中值 BGR → Lab a
+    bgr_vals: List[np.ndarray] = []
+    for lid in (205, 425):
+        cx, cy = landmark_xy(lm[lid], w, h)
+        x0, y0, pw, ph = skin_patch_rect_at(cx, cy, h, w, 14)
+        med = median_bgr_in_patch(bgra, x0, y0, pw, ph)
+        if med is not None:
+            bgr_vals.append(med.astype(np.float32))
+
+    if not bgr_vals:
+        # fallback：中性比例
+        return np.array([1.0, 1.0, 1.0], dtype=np.float32)
+
+    avg_bgr = np.mean(bgr_vals, axis=0).reshape(1, 1, 3).astype(np.uint8)
+    lab = cv2.cvtColor(avg_bgr, cv2.COLOR_BGR2LAB)
+    a_ref = float(lab[0, 0, 1]) - 128.0  # OpenCV Lab a 中心=128
+
+    # 比例幅度：a_ref 绝对值越大，通道偏差越大
+    amp = float(np.clip(abs(a_ref) / 10.0, 0.01, 0.08))
+    if a_ref > 0:
+        # 暖肤色：R 偏强，B 偏弱
+        scale = np.array([1.0 - amp, 1.0, 1.0 + amp], dtype=np.float32)
+    else:
+        # 冷肤色：B 偏强，R 偏弱
+        scale = np.array([1.0 + amp, 1.0, 1.0 - amp], dtype=np.float32)
+    return scale
 
 # --- Face Detail Tiling（旧路径，保留作可选）-----------------------------------------
 DETAIL_TILE_SIZE_FRAC = 0.20              # 0.45→0.20：更小 tile 减少非纹理结构混入
@@ -734,91 +837,6 @@ def image_quilt_in_mask(
 # 等价于 Poisson 频域近似，但更稳定 / 可控 / 实现简单。
 
 LAPLACIAN_LEVELS_DEFAULT = 5
-# 各级（高频→低频）混入 quilted 的比例。新默认更"挑剔"地只取 ultra-high freq 细节，
-# mid/low freq 几乎全用 procedural —— 这样 quilting 的 patch 接缝（典型 mid-freq
-# 现象）几乎不可能透出来。Level 2 通常对应 patch_size 波长，必须压到极低。
-LAPLACIAN_HIGH_FREQ_FROM_QUILT = (
-    1.0, 0.55, 0.15, 0.0, 0.0,
-)
-
-
-def _build_gaussian_pyramid(img: np.ndarray, levels: int) -> List[np.ndarray]:
-    pyr = [img.astype(np.float32)]
-    cur = img.astype(np.float32)
-    for _ in range(levels - 1):
-        cur = cv2.pyrDown(cur)
-        pyr.append(cur)
-    return pyr
-
-
-def _build_laplacian_pyramid(img: np.ndarray, levels: int) -> List[np.ndarray]:
-    gpyr = _build_gaussian_pyramid(img, levels)
-    lpyr = []
-    for i in range(levels - 1):
-        up = cv2.pyrUp(gpyr[i + 1], dstsize=(gpyr[i].shape[1], gpyr[i].shape[0]))
-        lpyr.append(gpyr[i] - up)
-    lpyr.append(gpyr[-1])  # 最低频留 Gaussian 顶端
-    return lpyr
-
-
-def _reconstruct_from_laplacian(lpyr: List[np.ndarray]) -> np.ndarray:
-    cur = lpyr[-1]
-    for lvl in range(len(lpyr) - 2, -1, -1):
-        cur = cv2.pyrUp(cur, dstsize=(lpyr[lvl].shape[1], lpyr[lvl].shape[0]))
-        cur = cur + lpyr[lvl]
-    return cur
-
-
-def laplacian_band_blend(
-    procedural_bgr: np.ndarray,
-    quilted_bgr: np.ndarray,
-    mask_2d: np.ndarray,
-    levels: int = LAPLACIAN_LEVELS_DEFAULT,
-    high_freq_quilt_mix: Tuple[float, ...] = LAPLACIAN_HIGH_FREQ_FROM_QUILT,
-) -> np.ndarray:
-    """
-    Laplacian 金字塔多频段融合。``mask_2d`` (h,w) bool 或 0~1 float，融合只在 mask 内进行。
-
-    在每一频段：
-        out_band = (1-α_band) * procedural_band + α_band * quilted_band
-    其中 ``α_band`` 是 ``high_freq_quilt_mix`` 在该频段对应的值（高频→1，低频→0），
-    超出 mask 的位置 α_band 强制为 0。
-    """
-    h, w = procedural_bgr.shape[:2]
-    if quilted_bgr.shape[:2] != (h, w):
-        raise ValueError("quilted shape mismatch")
-    levels = max(2, int(levels))
-    if len(high_freq_quilt_mix) != levels:
-        # 平移 / 截断 / 填充
-        mix = list(high_freq_quilt_mix)
-        if len(mix) < levels:
-            mix = mix + [mix[-1]] * (levels - len(mix))
-        mix = mix[:levels]
-    else:
-        mix = list(high_freq_quilt_mix)
-
-    if mask_2d.dtype == bool:
-        mask_f = mask_2d.astype(np.float32)
-    else:
-        mask_f = mask_2d.astype(np.float32)
-        if mask_f.max() > 1.5:
-            mask_f = mask_f / 255.0
-        mask_f = np.clip(mask_f, 0.0, 1.0)
-
-    lap_p = _build_laplacian_pyramid(procedural_bgr.astype(np.float32), levels)
-    lap_q = _build_laplacian_pyramid(quilted_bgr.astype(np.float32), levels)
-    g_mask = _build_gaussian_pyramid(mask_f, levels)
-
-    blended = []
-    for lvl in range(levels):
-        a = float(np.clip(mix[lvl], 0.0, 1.0))
-        gm = g_mask[lvl][..., None]
-        # 只在 mask 内做混入；mask 外完全用 procedural
-        band = lap_p[lvl] * (1.0 - a * gm) + lap_q[lvl] * (a * gm)
-        blended.append(band)
-
-    out = _reconstruct_from_laplacian(blended)
-    return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
 # =====================================================================================
@@ -889,25 +907,8 @@ def refine_alpha_via_matting(
 
 
 # =====================================================================================
-# Phase E: Pitié N-D PDF Color Transfer
+# Phase E: 颜色迁移 — L mean-shift + a/b CDF match
 # =====================================================================================
-
-PITIE_DEFAULT_ITER = 20
-# 注意：sub-sample + 1-NN 推广会在低相关度的相邻像素间产生 banding（实测 head.png 上
-# 出现横向暗带）。把阈值放大到 60000 让大部分 portrait 全量跑（~37k px 用 ~150ms 全跑）；
-# 大图 + > 60k px 时仍然 fallback 到 sub-sample 路径但用 k-NN 平均替代 1-NN。
-PITIE_SUBSAMPLE_SRC_MAX = 60000
-PITIE_KNN_K = 8
-
-
-def _random_orthogonal_3d(rng: np.random.Generator) -> np.ndarray:
-    """通过 QR 分解得到一个均匀分布的 3x3 正交矩阵。"""
-    A = rng.standard_normal((3, 3))
-    Q, R = np.linalg.qr(A)
-    # 修正符号歧义（QR 不保证 det = 1）
-    sign = np.sign(np.diag(R))
-    sign[sign == 0] = 1.0
-    return Q * sign
 
 
 def _match_1d_cdf(src: np.ndarray, ref_sorted: np.ndarray) -> np.ndarray:
@@ -924,63 +925,42 @@ def _match_1d_cdf(src: np.ndarray, ref_sorted: np.ndarray) -> np.ndarray:
     return out
 
 
-def pitie_pdf_transfer(
-    src_pixels: np.ndarray,
-    ref_pixels: np.ndarray,
-    n_iter: int = PITIE_DEFAULT_ITER,
-    seed: int = 4242,
-) -> np.ndarray:
-    """
-    Pitié & Kokaram 2007 N-D PDF transfer 主流程。
-    输入 (N,3) src 与 (M,3) ref（一般是 Lab 空间），返回 (N,3) 转移后的 src。
-    每轮：随机 3D 旋转 → 三通道 1D CDF 匹配 → 反旋转。
-    """
-    if src_pixels.size == 0 or ref_pixels.size == 0:
-        return src_pixels.copy()
-    rng = np.random.default_rng(seed)
-    src = src_pixels.astype(np.float64).copy()
-    ref = ref_pixels.astype(np.float64)
-    for _ in range(int(n_iter)):
-        R = _random_orthogonal_3d(rng)
-        src_r = src @ R
-        ref_r = ref @ R
-        # 三通道独立 1D CDF 匹配
-        for c in range(3):
-            ref_sorted_c = np.sort(ref_r[:, c])
-            src_r[:, c] = _match_1d_cdf(src_r[:, c], ref_sorted_c)
-        src = src_r @ R.T
-    return src
-
-
-# 当 src 的 Lab std 低于此阈值，认为分布近似常数，Pitié 会过度展开导致 banding；
-# 此时退化为 Reinhard mean shift（直接平移均值，不动 std）。
-PITIE_LOW_VAR_STD_THRESHOLD = 6.0  # std < 6 视为低方差（每个 Lab 通道）
-
-
 def _apply_L_meanshift_ab_cdf_inplace(
     layer_bgra: np.ndarray,
     mask_bool: np.ndarray,
     ref_pixels_bgr: np.ndarray,
     strength: float = 1.0,
+    alpha_map: Optional[np.ndarray] = None,
 ) -> None:
     """
-    **方案 4（CPU 纯算法路径优化）**：分通道处理 Lab 空间。
-    - L 通道：mean shift（保留 detail std，亮度 noise 完整透过，与原 Reinhard 一致）
-    - a, b 通道：1D CDF match（让色相分布完整迁移到 ref 分布形状，而非只动均值）
+    分通道处理 Lab 空间颜色迁移，支持 alpha 加权。
+    - L 通道：mean shift（保留 detail std，亮度 noise 完整透过）
+    - a, b 通道：1D CDF match（让色相分布完整迁移到 ref 分布形状）
 
-    动机：脖子色与脸的色相不仅"中心"不同，**分布形状也不同**——脸有颊红区(a 高)、
-    额黄区(b 高)等结构。原 Reinhard mean shift 只把分布的中心拖过去，分布形状还是
-    procedural 的"几乎单峰"，色相整体偏冷或偏中性。CDF match 让脖子的 a/b 分布
-    完整覆盖脸的 a/b 分布形状，色相对齐更精细。
-
-    L 通道仍走 mean shift 而不是 CDF match：因为 L 上有 detail noise（毛孔级 std≈1），
-    CDF match 会把 L 分布替换成 ref 的分布形状，detail 被抹平（参见之前 Pitié 实验）。
+    ``alpha_map`` 为 (h,w) float64 in [0,1] 时，每个像素的实际校正强度 =
+    ``strength × alpha_map[i,j]``。这使边缘过渡带（alpha 0.05~0.3）也得到
+    部分颜色校正，避免硬阈值导致的色差接缝。``alpha_map=None`` 时退化为
+    统一 strength（兼容旧调用）。
     """
     if ref_pixels_bgr.shape[0] < 8 or not np.any(mask_bool):
         return
+    h, w = layer_bgra.shape[:2]
     bgr = layer_bgra[:, :, :3]
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    src = lab[mask_bool]
+
+    has_alpha = alpha_map is not None
+    if has_alpha:
+        alpha_f = np.clip(alpha_map.astype(np.float32), 0.0, 1.0)
+        # 用 alpha > 0.02 确定参与计算的像素（避免除零和无效运算）
+        work_mask = alpha_f > 0.02
+    else:
+        work_mask = mask_bool
+        alpha_f = None
+
+    if not np.any(work_mask):
+        return
+
+    src = lab[work_mask]
     if src.shape[0] < 8:
         return
     ref_lab = cv2.cvtColor(
@@ -1002,131 +982,19 @@ def _apply_L_meanshift_ab_cdf_inplace(
 
     src_new = np.stack([new_L, new_a, new_b], axis=1)
     src_new = np.clip(src_new, 0.0, 255.0)
-    lab[mask_bool] = src_new
-    out_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    layer_bgra[:, :, :3] = out_bgr
 
-
-def _reinhard_mean_shift_inplace(
-    layer_bgra: np.ndarray,
-    mask_bool: np.ndarray,
-    ref_pixels_bgr: np.ndarray,
-    strength: float = 0.85,
-) -> None:
-    """Lab 空间均值偏移（沿用 add_neck.py 的 reinhard_lab_mean_shift_bgra_inplace 思路）。"""
-    if ref_pixels_bgr.shape[0] < 8 or not np.any(mask_bool):
-        return
-    bgr = layer_bgra[:, :, :3]
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    src = lab[mask_bool]
-    if src.shape[0] < 8:
-        return
-    src_mean = src.mean(axis=0)
-    ref_lab = cv2.cvtColor(
-        ref_pixels_bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB
-    ).reshape(-1, 3).astype(np.float32)
-    ref_mean = ref_lab.mean(axis=0)
-    s = float(np.clip(strength, 0.0, 1.0))
-    shift = (ref_mean - src_mean) * s
-    src_adj = np.clip(src + shift, 0.0, 255.0)
-    lab[mask_bool] = src_adj
-    out_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    layer_bgra[:, :, :3] = out_bgr
-
-
-def apply_pitie_to_layer_inplace(
-    layer_bgra: np.ndarray,
-    mask_bool: np.ndarray,
-    ref_pixels_bgr: np.ndarray,
-    strength: float = 0.65,
-    n_iter: int = PITIE_DEFAULT_ITER,
-    subsample_src_max: int = PITIE_SUBSAMPLE_SRC_MAX,
-    seed: int = 4242,
-    low_var_threshold: float = PITIE_LOW_VAR_STD_THRESHOLD,
-) -> None:
-    """
-    把 layer 在 mask 内的 BGR 经过 Pitié 转移到 ref 分布，按 strength 与原值线性混合。
-    Lab 空间执行。
-
-    **关键安全网**：当 src 在 Lab 任一通道的 std 低于 ``low_var_threshold``，认为
-    src 是 near-constant（如 procedural 均匀 albedo + 微弱 L 调制的脖子），此时
-    Pitié 会把无意义的 micro-variation 放大成完整 ref 分布，产生可见 banding。
-    自动退化为 ``_reinhard_mean_shift_inplace``（仅 mean shift），可避免 banding。
-
-    **Sub-sampling 优化**：当源像素 > subsample_src_max 且非 near-constant 时，
-    随机抽 subsample_src_max 子集跑 Pitié，再用 3D **k-NN 加权平均**推广。
-    """
-    if ref_pixels_bgr.shape[0] < 8 or not np.any(mask_bool):
-        return
-    bgr_full = layer_bgra[:, :, :3]
-    lab_full = cv2.cvtColor(bgr_full, cv2.COLOR_BGR2LAB).astype(np.float64)
-    src_lab = lab_full[mask_bool]  # (N, 3)
-    n = src_lab.shape[0]
-    ref_lab = (
-        cv2.cvtColor(ref_pixels_bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB)
-        .reshape(-1, 3)
-        .astype(np.float64)
-    )
-
-    # 低方差检测 → 退化为 Reinhard
-    src_std = float(np.max(np.std(src_lab, axis=0)))
-    if src_std < float(low_var_threshold):
-        _reinhard_mean_shift_inplace(layer_bgra, mask_bool, ref_pixels_bgr, strength=strength)
-        return
-
-    rng = np.random.default_rng(seed)
-    if n > subsample_src_max:
-        sub_idx = rng.choice(n, subsample_src_max, replace=False)
-        sub_src = src_lab[sub_idx]
-        sub_dst = pitie_pdf_transfer(sub_src, ref_lab, n_iter=n_iter, seed=seed)
-        new_src = _nearest_map_3d(src_lab, sub_src, sub_dst)
+    if has_alpha:
+        # per-pixel 混合：final = original × (1 - s×alpha_i) + corrected × (s×alpha_i)
+        pixel_alpha = alpha_f[work_mask]  # (N,)
+        blend = pixel_alpha[:, None].astype(np.float32)  # (N,1)
+        blended = src * (1.0 - s * blend) + src_new * (s * blend)
+        blended = np.clip(blended, 0.0, 255.0)
+        lab[work_mask] = blended
     else:
-        new_src = pitie_pdf_transfer(src_lab, ref_lab, n_iter=n_iter, seed=seed)
+        lab[work_mask] = src_new
 
-    s = float(np.clip(strength, 0.0, 1.0))
-    blended = src_lab * (1.0 - s) + new_src * s
-    blended = np.clip(blended, 0.0, 255.0)
-
-    lab_full[mask_bool] = blended
-    out_bgr = cv2.cvtColor(lab_full.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    out_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     layer_bgra[:, :, :3] = out_bgr
-
-
-def _nearest_map_3d(
-    query: np.ndarray,
-    anchors: np.ndarray,
-    anchor_targets: np.ndarray,
-    k: int = PITIE_KNN_K,
-) -> np.ndarray:
-    """
-    用 anchors→anchor_targets 的散点映射，对 query 做 **k-NN 加权平均**查表（替代 1-NN）。
-    1-NN 在低相关度区会让相邻像素跳到不同目标，产生 banding；k-NN 加权平均显著平滑。
-    距离权重 = 1 / (d + ε)。分块计算避免 O(N*M) 内存。
-    """
-    n_q = query.shape[0]
-    n_a = anchors.shape[0]
-    k_eff = min(int(k), n_a)
-    out = np.empty_like(query)
-    chunk = 4096
-    a_sq = np.sum(anchors * anchors, axis=1)  # (n_a,)
-    for i in range(0, n_q, chunk):
-        q = query[i : i + chunk]
-        q_sq = np.sum(q * q, axis=1, keepdims=True)
-        d = q_sq + a_sq[None, :] - 2.0 * (q @ anchors.T)
-        d = np.maximum(d, 0.0)
-        if k_eff <= 1:
-            idx = np.argmin(d, axis=1)
-            out[i : i + chunk] = anchor_targets[idx]
-            continue
-        # 取 k 个最近，加权平均
-        idx_topk = np.argpartition(d, k_eff, axis=1)[:, :k_eff]  # (chunk, k)
-        rows = np.arange(idx_topk.shape[0])[:, None]
-        d_top = d[rows, idx_topk]
-        w = 1.0 / (np.sqrt(d_top) + 1e-3)  # 距离权重
-        w = w / np.sum(w, axis=1, keepdims=True)
-        targets = anchor_targets[idx_topk]  # (chunk, k, 3)
-        out[i : i + chunk] = np.sum(targets * w[:, :, None], axis=1)
-    return out
 
 
 # =====================================================================================
@@ -1354,11 +1222,13 @@ def realism_pipeline(
             if PINK_NOISE_BLUR_SIGMA > 0:
                 bk = odd_kernel(int(round(PINK_NOISE_BLUR_SIGMA * 3.0)) + 1)
                 noise_gray = cv2.GaussianBlur(noise_gray, (bk, bk), PINK_NOISE_BLUR_SIGMA)
-            # 3 通道共享，但允许 R/G/B 各通道有微小色相波动（×0.95~1.05 让它不完全单调）
+            # 3 通道共享，色相波动自适应：从脸部锚定肤色 Lab a 通道决定方向和幅度
+            # a > 0 → 暖肤色（R 偏强），a < 0 → 冷肤色（B 偏强）
+            noise_bgr_scale = _compute_noise_bgr_scale(bgra, landmarks, h, w)
             noise = np.stack([
-                noise_gray * 0.95,
-                noise_gray * 1.00,
-                noise_gray * 1.05,
+                noise_gray * noise_bgr_scale[0],  # B
+                noise_gray * noise_bgr_scale[1],  # G
+                noise_gray * noise_bgr_scale[2],  # R
             ], axis=-1).astype(np.float32)
             detail = noise * edge_weight[..., None] * mask_bool[..., None].astype(np.float32)
             have_texture = True
@@ -1410,15 +1280,37 @@ def realism_pipeline(
         k = odd_kernel(int(round(sigma * 3.0)) + 1)
         refined_alpha = (cv2.GaussianBlur(polygon_mask_u8.astype(np.float32), (k, k), sigma) / 255.0).astype(np.float64)
 
-    # ---------- Phase E: 颜色迁移（方案 2 ref pool + 方案 4 分通道处理）---------------
+    # ---------- Phase E: 颜色迁移（下巴过渡区 + 脸部整体混合参考 + alpha 加权）---------
+    ref_pixels = np.empty((0, 3), dtype=np.uint8)
     if enable_pitie:
-        ref_pixels = gather_face_oval_skin_pixels(bgra, landmarks, h, w)
-        if ref_pixels.shape[0] < 200:
+        # 参考像素：50% 下巴过渡区 + 50% 脸部整体，保证接缝处颜色连续
+        chin_pixels = gather_chin_strip_skin_pixels(bgra, landmarks, h, w, jaw_span)
+        oval_pixels = gather_face_oval_skin_pixels(bgra, landmarks, h, w)
+        if chin_pixels.shape[0] >= 200 and oval_pixels.shape[0] >= 200:
+            # 各取一半，按数量等比抽样
+            n_chin = chin_pixels.shape[0]
+            n_oval = oval_pixels.shape[0]
+            target_chin = min(n_chin, max(n_oval, 200))
+            target_oval = min(n_oval, max(n_chin, 200))
+            rng_ref = np.random.default_rng(42)
+            if n_chin > target_chin:
+                idx = rng_ref.choice(n_chin, target_chin, replace=False)
+                chin_pixels = chin_pixels[idx]
+            if n_oval > target_oval:
+                idx = rng_ref.choice(n_oval, target_oval, replace=False)
+                oval_pixels = oval_pixels[idx]
+            ref_pixels = np.vstack([chin_pixels, oval_pixels])
+        elif oval_pixels.shape[0] >= 8:
+            ref_pixels = oval_pixels
+        else:
             ref_pixels = _gather_neck_ref_pixels(bgra, landmarks, h, w)
-        pitie_mask = refined_alpha > 0.05
-        _apply_L_meanshift_ab_cdf_inplace(
-            blended_bgra, pitie_mask, ref_pixels, strength=pitie_strength,
-        )
+
+        if ref_pixels.shape[0] >= 8:
+            pitie_mask = polygon_mask_u8 >= 1  # 基础工作掩码
+            _apply_L_meanshift_ab_cdf_inplace(
+                blended_bgra, pitie_mask, ref_pixels,
+                strength=pitie_strength, alpha_map=refined_alpha,
+            )
 
     # ---------- 方案 5: 胡茬检测 + 颌下暗调叠加 -------------------------------------
     # 检测脸是否有胡茬（下巴上 V < 颊 V 多少），若 strength>0 则在脖子顶端区域叠加
