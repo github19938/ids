@@ -160,7 +160,7 @@ class MakeIDPhoto:
             raise RuntimeError(f"原图未检测到人脸: {self.source_path}")
 
         # 3. 头像加底部 padding，给脖子留绘制空间
-        head_padded = self._ensure_neck_drawing_space(head)
+        head_padded = self._ensure_neck_drawing_space(head, self._effective_pad_factor())
         head_face = self._detect_face_landmarks(head_padded)
         if head_face is None:
             raise RuntimeError(f"头像未检测到人脸: {self.head_path}")
@@ -438,9 +438,16 @@ class MakeIDPhoto:
         cx_top = float(np.mean(top_xy[:, 0]))
         top_xy[:, 0] = cx_top + (top_xy[:, 0] - cx_top) * self.NECK_TOP_INSET
 
-        # 下沿：上沿各点水平方向按 NECK_BOTTOM_FLARE 从中心外扩，y 统一下移 neck_depth
+        # 下沿：上沿各点水平方向按 NECK_BOTTOM_FLARE 从中心外扩，y 统一往**下**延伸。
+        # ★ 当 stretch 启用且 neck_target_length > NECK_DEPTH_FRAC 时，
+        #   polygon 下沿同步向下延伸到 chin_y + neck_target_length × jaw_span，
+        #   保证画布上看到的脖子长度跟 source 拉伸长度一致（不只往上挤进下巴）。
         cx = float(np.mean(top_xy[:, 0]))
-        bot_y = float(np.max(top_xy[:, 1])) + jaw_span * self.NECK_DEPTH_FRAC
+        if (self.stretch_mode != self.STRETCH_MODE_NONE
+                and self.neck_target_length > self.NECK_DEPTH_FRAC):
+            bot_y = float(chin[1]) + jaw_span * self.neck_target_length
+        else:
+            bot_y = float(np.max(top_xy[:, 1])) + jaw_span * self.NECK_DEPTH_FRAC
         bottom_xy = np.column_stack([
             cx + (top_xy[:, 0] - cx) * self.NECK_BOTTOM_FLARE,
             np.full(n_top, bot_y, dtype=np.float64),
@@ -634,11 +641,21 @@ class MakeIDPhoto:
         """归一化 landmark → 像素坐标。"""
         return float(landmark.x * w), float(landmark.y * h)
 
+    def _effective_pad_factor(self) -> float:
+        """画布底部预留 padding 因子。stretch 启用且 target 大于默认深度时按 target+0.4 计算。"""
+        base = self.NECK_DRAWING_PAD_FACTOR
+        if (self.stretch_mode != self.STRETCH_MODE_NONE
+                and self.neck_target_length > self.NECK_DEPTH_FRAC):
+            return max(base, float(self.neck_target_length) + 0.4)
+        return base
+
     @classmethod
-    def _ensure_neck_drawing_space(cls, bgra: np.ndarray) -> np.ndarray:
+    def _ensure_neck_drawing_space(
+        cls, bgra: np.ndarray, pad_factor: Optional[float] = None,
+    ) -> np.ndarray:
         """
         若 chin 下方画布空间不足画脖子（chin 太靠近底端），
-        在画布底部加透明 padding，留 jaw_span × NECK_DRAWING_PAD_FACTOR。
+        在画布底部加透明 padding，留 jaw_span × pad_factor。
         """
         face = cls._detect_face_landmarks(bgra)
         if face is None:
@@ -650,7 +667,8 @@ class MakeIDPhoto:
         jaw_span = float(np.hypot(jl[0] - jr[0], jl[1] - jr[1]))
         if jaw_span < 12.0:
             return bgra
-        needed = int(round(jaw_span * cls.NECK_DRAWING_PAD_FACTOR))
+        pf = float(pad_factor) if pad_factor is not None else cls.NECK_DRAWING_PAD_FACTOR
+        needed = int(round(jaw_span * pf))
         available = h - int(chin_y)
         if available >= needed:
             return bgra
