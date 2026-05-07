@@ -268,6 +268,7 @@ def add_clothes(
         head_with_neck, _skin_marked = add_fake_neck_v1(
             head_bgra_expanded,
             source_image_path=source_image_path,
+            for_clothes_compositing=True,  # ★ 衣领合成模式：脖子塞满 V 领、不 fade、色调更主动适应
         )
     except Exception as e:
         print(f"[错误] 添加脖子失败: {e}", file=sys.stderr)

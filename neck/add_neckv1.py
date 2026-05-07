@@ -1360,9 +1360,18 @@ def realism_pipeline(
     quilt_method: str = "tile",
     source_neck_pixels: Optional[np.ndarray] = None,
     source_warped_bgra: Optional[np.ndarray] = None,
+    disable_fade_out: bool = False,
+    transplant_tone_match_strength: float = TRANSPLANT_TONE_MATCH_STRENGTH,
 ) -> Tuple[np.ndarray, V1DebugInfo]:
     """
     Phase A 之"真实感主流程"：在 procedural 层之上跑 B/C/D/E。
+
+    ``disable_fade_out=True``: 跳过底端 vertical fade-out，脖子在 polygon mask 内
+    保持满 alpha。用于"脖子被衣领遮住"场景（add_clothes 调用），这种场景下
+    fade-out 会让 V 领位置脖子半透明，蓝底背景透出来。
+    ``transplant_tone_match_strength``: transplant 模式下 Reinhard 颜色对齐强度，
+    默认 0.30 (TRANSPLANT_TONE_MATCH_STRENGTH)；用于衣领合成场景时建议 0.6 以上，
+    让脖子色更主动适应 head 脸的光照。
     """
     h, w = bgra.shape[:2]
     mask_bool = polygon_mask_u8 >= 1
@@ -1452,11 +1461,26 @@ def realism_pipeline(
             iterations=1,
         )
         em = eroded_mask > 0
-        # 中央用原图，mask 边缘 1px 平滑过渡到 procedural detail（避免硬接缝）
+        # 限制 transplant 只覆盖 polygon 上 70% 区域（chin 下方的脖子皮肤区），
+        # 下 30% 不做 transplant 替换——避免把原图的衣领/T恤等非脖子内容拷过来。
+        # 这样配合 disable_fade_out=True（衣领合成场景），下半段保留 procedural 合成
+        # 肤色，能被衣服 V 领开口自然遮住而不透出白色衣领。
+        y_min_p = float(np.min(poly[:, 1]))
+        y_max_p = float(np.max(poly[:, 1]))
+        poly_h_p = max(y_max_p - y_min_p, 1.0)
+        transplant_y_max = y_min_p + poly_h_p * 0.70
+        yy_grid = np.arange(h, dtype=np.float64)[:, None]
+        transplant_y_ok = yy_grid <= transplant_y_max  # (h, 1)
+        # 边缘 ~10px 软过渡：transplant_y_max 上下 5px 内 alpha 线性渐变
+        soft_zone = np.clip((transplant_y_max - yy_grid) / 5.0, 0.0, 1.0)  # (h, 1)
+        # 中央用原图（带 y 软过渡），mask 边缘 1px 平滑过渡到 procedural detail
         blended_bgr_arr = blended_bgr.astype(np.float32)
         warped_bgr = source_warped_bgra[:, :, :3].astype(np.float32)
-        blended_bgr = np.where(em[..., None], warped_bgr, blended_bgr_arr)
-        blended_bgr = np.clip(blended_bgr, 0, 255).astype(np.uint8)
+        soft_3 = soft_zone[..., None].astype(np.float32)  # (h,1,1) → broadcast
+        em_3 = em[..., None].astype(np.float32)  # (h,w,1)
+        blend_w = em_3 * soft_3
+        blended_bgr_f = warped_bgr * blend_w + blended_bgr_arr * (1.0 - blend_w)
+        blended_bgr = np.clip(blended_bgr_f, 0, 255).astype(np.uint8)
 
     blended_bgra = np.dstack([blended_bgr, polygon_mask_u8])
 
@@ -1518,7 +1542,7 @@ def realism_pipeline(
             pitie_mask = polygon_mask_u8 >= 1
             # transplant 模式用更低强度（仅适应光照），其他路径用原 strength
             effective_strength = (
-                TRANSPLANT_TONE_MATCH_STRENGTH if transplant_active else pitie_strength
+                float(transplant_tone_match_strength) if transplant_active else pitie_strength
             )
             _apply_L_meanshift_ab_cdf_inplace(
                 blended_bgra, pitie_mask, ref_pixels,
@@ -1549,18 +1573,21 @@ def realism_pipeline(
     # ---------- 底端 vertical fade-out（衣领过渡）-----------------------------------
     # imagev2 中脖子在 chin+50% jaw_span 处就过渡到衣领（白底图里直接是白）。
     # 让多边形下 50% 高度的 alpha 渐隐到 0，模拟「脖子下端→衣领→背景」的自然过渡。
-    y_min_poly = float(np.min(poly[:, 1]))
-    y_max_poly = float(np.max(poly[:, 1]))
-    poly_height = max(y_max_poly - y_min_poly, 1.0)
-    yy = np.arange(h, dtype=np.float64)[:, None]
-    yn_poly = np.clip((yy - y_min_poly) / poly_height, 0.0, 1.0)
-    fade_start = 0.50  # 0.50 → 1.0 段做 fade（之前 0.65，现在更早过渡）
-    fade = np.where(
-        yn_poly < fade_start,
-        1.0,
-        np.clip(1.0 - (yn_poly - fade_start) / (1.0 - fade_start), 0.0, 1.0) ** 1.2,
-    )
-    final_alpha = final_alpha * fade
+    # disable_fade_out=True（衣领合成场景）时跳过：脖子在 polygon mask 内保持满 alpha，
+    # 避免 V 领位置脖子半透明导致蓝底渗出。
+    if not disable_fade_out:
+        y_min_poly = float(np.min(poly[:, 1]))
+        y_max_poly = float(np.max(poly[:, 1]))
+        poly_height = max(y_max_poly - y_min_poly, 1.0)
+        yy = np.arange(h, dtype=np.float64)[:, None]
+        yn_poly = np.clip((yy - y_min_poly) / poly_height, 0.0, 1.0)
+        fade_start = 0.50
+        fade = np.where(
+            yn_poly < fade_start,
+            1.0,
+            np.clip(1.0 - (yn_poly - fade_start) / (1.0 - fade_start), 0.0, 1.0) ** 1.2,
+        )
+        final_alpha = final_alpha * fade
 
     blended_bgra[:, :, 3] = np.clip(np.round(final_alpha * 255.0), 0, 255).astype(np.uint8)
 
@@ -1604,6 +1631,7 @@ def add_fake_neck_v1(
     cylinder_strength: float = 0.30,          # flat_shading=False 时圆柱明暗强度系数
     neck_depth_frac: float = 1.4,             # neck_depth = jaw_span * neck_depth_frac（1.85→1.4 更短）
     source_image_path: Optional[str] = None,  # 原图（带真实脖子）路径；非空且检测到脖子 → 严格按原图脖子色
+    for_clothes_compositing: bool = False,    # ★ 衣领合成场景模式开关
     laplacian_levels: int = LAPLACIAN_LEVELS_DEFAULT,
     rng_seed: int = QUILT_RNG_SEED,
     face_mesh: Optional[object] = None,
@@ -1615,6 +1643,24 @@ def add_fake_neck_v1(
     """
     h, w = bgra.shape[:2]
     rgb = bgra_to_rgb(bgra)
+
+    # ★ 衣领合成场景：override 默认参数让脖子塞满 V 领、不渐隐、色调更主动适应 head 脸
+    disable_fade_out_effective = False
+    transplant_strength_effective = TRANSPLANT_TONE_MATCH_STRENGTH
+    if for_clothes_compositing:
+        # 1. 脖子顶宽几乎=下颌宽，避免 V 领开口看到蓝底渗出
+        neck_top_inset = max(neck_top_inset, 0.95)
+        # 2. 脖子长度：精确覆盖到 V 领位置（add_clothes 默认 V 领在 chin+0.7×jaw_span）
+        #    polygon 高度 = jaw_span × frac × slim ≈ frac × 0.87 × jaw_span
+        #    让 polygon 底端 ≈ chin + 0.95 × jaw_span（V 领下方 25%，被衣领遮住的过渡区）
+        #    → frac = 0.95 / 0.87 ≈ 1.1
+        neck_depth_frac = 1.1
+        # 3. 关闭底端 fade-out：在 polygon mask 内保持满 alpha
+        disable_fade_out_effective = True
+        # 4. transplant 时更主动适应 head 脸色（0.30 → 0.60），消除脸-脖子色差
+        transplant_strength_effective = 0.60
+        # 5. 关掉胡茬阴影（衣领遮住下端，胡茬阴影在 V 领内可能产生不自然暗带）
+        enable_stubble = False
 
     if face_mesh is not None:
         landmarks = _detect_first_face(face_mesh, rgb)
@@ -1703,6 +1749,8 @@ def add_fake_neck_v1(
         quilt_method=quilt_method,
         source_neck_pixels=source_neck_pixels,
         source_warped_bgra=source_warped,
+        disable_fade_out=disable_fade_out_effective,
+        transplant_tone_match_strength=transplant_strength_effective,
     )
     info = info._replace(pose=(yaw, pitch, roll))
 
