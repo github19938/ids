@@ -867,6 +867,56 @@ def pitie_pdf_transfer(
 PITIE_LOW_VAR_STD_THRESHOLD = 6.0  # std < 6 视为低方差（每个 Lab 通道）
 
 
+def _apply_L_meanshift_ab_cdf_inplace(
+    layer_bgra: np.ndarray,
+    mask_bool: np.ndarray,
+    ref_pixels_bgr: np.ndarray,
+    strength: float = 1.0,
+) -> None:
+    """
+    **方案 4（CPU 纯算法路径优化）**：分通道处理 Lab 空间。
+    - L 通道：mean shift（保留 detail std，亮度 noise 完整透过，与原 Reinhard 一致）
+    - a, b 通道：1D CDF match（让色相分布完整迁移到 ref 分布形状，而非只动均值）
+
+    动机：脖子色与脸的色相不仅"中心"不同，**分布形状也不同**——脸有颊红区(a 高)、
+    额黄区(b 高)等结构。原 Reinhard mean shift 只把分布的中心拖过去，分布形状还是
+    procedural 的"几乎单峰"，色相整体偏冷或偏中性。CDF match 让脖子的 a/b 分布
+    完整覆盖脸的 a/b 分布形状，色相对齐更精细。
+
+    L 通道仍走 mean shift 而不是 CDF match：因为 L 上有 detail noise（毛孔级 std≈1），
+    CDF match 会把 L 分布替换成 ref 的分布形状，detail 被抹平（参见之前 Pitié 实验）。
+    """
+    if ref_pixels_bgr.shape[0] < 8 or not np.any(mask_bool):
+        return
+    bgr = layer_bgra[:, :, :3]
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    src = lab[mask_bool]
+    if src.shape[0] < 8:
+        return
+    ref_lab = cv2.cvtColor(
+        ref_pixels_bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB
+    ).reshape(-1, 3).astype(np.float32)
+    s = float(np.clip(strength, 0.0, 1.0))
+
+    # L 通道：mean shift
+    L_shift = (ref_lab[:, 0].mean() - src[:, 0].mean()) * s
+    new_L = src[:, 0] + L_shift
+
+    # a, b 通道：1D CDF match (rank-based 分位数映射)
+    ref_a_sorted = np.sort(ref_lab[:, 1])
+    ref_b_sorted = np.sort(ref_lab[:, 2])
+    cdf_a = _match_1d_cdf(src[:, 1].astype(np.float64), ref_a_sorted.astype(np.float64))
+    cdf_b = _match_1d_cdf(src[:, 2].astype(np.float64), ref_b_sorted.astype(np.float64))
+    new_a = src[:, 1] * (1.0 - s) + cdf_a.astype(np.float32) * s
+    new_b = src[:, 2] * (1.0 - s) + cdf_b.astype(np.float32) * s
+
+    src_new = np.stack([new_L, new_a, new_b], axis=1)
+    src_new = np.clip(src_new, 0.0, 255.0)
+    lab[mask_bool] = src_new
+    out_bgr = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    layer_bgra[:, :, :3] = out_bgr
+
+
 def _reinhard_mean_shift_inplace(
     layer_bgra: np.ndarray,
     mask_bool: np.ndarray,
@@ -1269,18 +1319,17 @@ def realism_pipeline(
         k = odd_kernel(int(round(sigma * 3.0)) + 1)
         refined_alpha = (cv2.GaussianBlur(polygon_mask_u8.astype(np.float32), (k, k), sigma) / 255.0).astype(np.float64)
 
-    # ---------- Phase E: 颜色迁移（默认 Reinhard mean shift）-----------------------------
-    # 关键：Pitié 会把 detail noise 的 std 替换成 ref 的低 std，导致毛孔纹理被抹掉
-    # （std 从 12 降到 3）。改用 Reinhard mean shift——只动 mean、保留 std，detail 完整透过。
-    # 方案 2: ref pool 优先用 face oval 整脸全像素（~30-50k px），mean 估计标准误降 ~7×；
+    # ---------- Phase E: 颜色迁移（方案 2 ref pool + 方案 4 分通道处理）---------------
+    # 方案 2: ref pool 优先用 face oval 整脸最亮 40%（~14k px），mean 估计标准误降 ~4×；
     #         失败回退到 _gather_neck_ref_pixels（5-landmark 小样本）。
+    # 方案 4: L 通道 mean shift（保留 detail noise）+ a/b 通道 CDF match（迁移色相分布
+    #         的形状，不是只动均值），比单一 Reinhard mean shift 更精细。
     if enable_pitie:
         ref_pixels = gather_face_oval_skin_pixels(bgra, landmarks, h, w)
         if ref_pixels.shape[0] < 200:
-            # face oval 路径失败 / 像素过少（如脸太小、被遮挡），fallback 到 5-landmark
             ref_pixels = _gather_neck_ref_pixels(bgra, landmarks, h, w)
         pitie_mask = refined_alpha > 0.05
-        _reinhard_mean_shift_inplace(
+        _apply_L_meanshift_ab_cdf_inplace(
             blended_bgra, pitie_mask, ref_pixels, strength=pitie_strength,
         )
 
