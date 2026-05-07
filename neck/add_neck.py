@@ -59,18 +59,37 @@ JAW_SPAN_OVERLAP_MAX_PX = 60.0
 JAW_SPAN_DEPTH_FRAC = 1.85
 JAW_SPAN_DEPTH_MIN_PX = 36.0
 
-# 沿「到上沿折线」的距离做的羽化/抑制（替代原来基于 chin_y 的硬过渡）
+# 沿「到上沿折线」的距离做的羽化/抑制（替代原来基于 chin_y 的硬过渡）。
+# 高分辨率时 8 px 不够、放大后会显边；上限提到 16 px 保证 4K 图也平滑。
 NECK_FEATHER_FRAC = 0.025
 NECK_FEATHER_MIN_PX = 1.5
-NECK_FEATHER_MAX_PX = 8.0
+NECK_FEATHER_MAX_PX = 16.0
 NECK_SUPPRESS_DECAY_FRAC = 0.06
 NECK_SUPPRESS_DECAY_MIN_PX = 4.0
+# 多边形 mask 超采样倍数：先在 SS× 分辨率下 fillPoly，再用 INTER_AREA 下采样获得 AA 边
+NECK_MASK_SUPERSAMPLE = 2
 
-# 脖子相对脸部「色调偏暖偏暗」微调：在 HSV 上额外移 H、缩 S（V 已由 skin_v_scale 处理）
-NECK_HUE_SHIFT_DEFAULT = 1.6
-NECK_SAT_SCALE_DEFAULT = 1.05
-# Reinhard Lab 颜色统计匹配（仅 mean shift）强度：把脖子 BGR 整体均值朝脸部肤色像素均值拉近
-NECK_TONE_MATCH_STRENGTH = 0.40
+# 脖子相对脸部「色调偏暖偏暗」微调：在 HSV 上额外移 H、缩 S（V 已由 skin_v_scale 处理）。
+# 默认值刻意保持非常温和，避免和脸部出现「色相反差」；剩下的色调统一交给 Reinhard Lab 匹配做。
+NECK_HUE_SHIFT_DEFAULT = 0.6
+NECK_SAT_SCALE_DEFAULT = 1.02
+# Reinhard Lab 颜色统计匹配（仅 mean shift）强度：把脖子 BGR 整体均值朝脸部肤色像素均值拉近。
+# 默认值偏强（0.65），把神经网络/RGBA 抠图带来的色阶偏差大部分抹掉。
+NECK_TONE_MATCH_STRENGTH = 0.65
+# Lab 匹配的参考池关键点：刻意去掉额头（10）和上颊（103/332），保留下半脸 + 下颌角附近，
+# 让脖子色匹配真正连接的「下颌-颈」区域而不是整个脸的均值（额头通常更亮，会让脖子偏白）。
+NECK_TONE_REF_LANDMARK_IDS: Tuple[int, ...] = (205, 425, 164, 200, 172, 397)
+NECK_TONE_REF_PATCH_PX = 16
+
+# 原图 alpha 边缘 γ：suppress = (oa^gamma) * envelope；γ<1 让中间 α 区压制更猛、消除穿帮 halo
+NECK_SUPPRESS_ALPHA_GAMMA = 0.55
+
+# 已有脖子/衣领探测：在 chin 下方沿中心垂直条带探查 alpha 延伸，若较大则缩短假脖子
+COLLAR_PROBE_HALF_WIDTH_FRAC = 0.18      # 探查带宽 = jaw_span 的 ±18%
+COLLAR_PROBE_MAX_FRAC = 2.0              # 最远探到 jaw_span 的 2 倍
+COLLAR_ALPHA_THRESHOLD = 128             # alpha > 该阈值视为「已有内容」
+COLLAR_DETECT_MIN_FRAC = 0.30            # 延伸超过 jaw_span 的 30% → 认为图里已有脖子/衣领
+COLLAR_DEPTH_SHRINK_MIN_PX = 12.0        # 即便检出衣领，也至少留这么多脖子缝隙避免硬接
 
 # Film grain：脸部采样块灰度 std → 脖子 ``cv2.randn`` 标准差（自适应「包浆」）
 GRAIN_REF_GAIN_DEFAULT = 1.08
@@ -88,13 +107,41 @@ NECK_CYLINDER_AO_TOP = 0.028
 # 距离变换衰减长度（相对脖子深度 depth 的比例，下限像素）
 NECK_AO_DT_TAU_FRAC = 0.24
 NECK_AO_DT_TAU_MIN_PX = 6.0
-# 左右颊 V 通道差 → 圆柱轴 / 高光横向偏移（左亮则轴与高光略向左）
+# 多点估光（L/R 颊、额左右、下颌左右、额中、下巴上）→ 最小二乘拟合 2D V 梯度，
+# 比单一「左右颊 V 差」对侧光/平光/俯仰光更鲁棒，并能避免「默认主光偏左」的硬编码偏置。
+LIGHT_SAMPLE_LANDMARKS: List[Tuple[int, str, int]] = [
+    (205, "L-cheek", SKIN_PATCH_CHEEK_PX),
+    (425, "R-cheek", SKIN_PATCH_CHEEK_PX),
+    (103, "L-forehead", SKIN_PATCH_OTHER_PX),
+    (332, "R-forehead", SKIN_PATCH_OTHER_PX),
+    (172, "L-jaw", SKIN_PATCH_OTHER_PX),
+    (397, "R-jaw", SKIN_PATCH_OTHER_PX),
+    (10, "forehead-mid", SKIN_PATCH_OTHER_PX),
+    (200, "above-chin", SKIN_PATCH_OTHER_PX),
+]
+# V 梯度（lstsq 拟合 V = a + b*x_norm + c*y_norm，x/y 已用 R 归一化）→ 圆柱轴 / 高光横向偏移
 NECK_LIGHT_AXIS_GAIN = 0.88
 NECK_SHINE_TRACK_GAIN = 0.58
 NECK_SHINE_K = 0.042
-NECK_SHINE_SIGMA_FRAC = 0.19
-# 默认主光略偏左时的高光基线（相对轴再往左）
-NECK_SHINE_BASE_OFFSET_FRAC = 0.15
+# 双层高光：窄 specular 峰（高频反射）+ 宽漫射 roll-off（皮肤次表面散射使高光柔化）
+NECK_SHINE_SIGMA_FRAC = 0.10
+NECK_SHINE_DIFFUSE_SIGMA_FRAC = 0.45
+NECK_SHINE_NARROW_SHARE = 0.55  # 0~1：能量分配到窄峰的比例，剩下给宽 roll-off
+# 「默认主光偏左」的硬编码偏置已移除，spec 中心位置完全由数据驱动；
+# 仅保留一个 SAFETY 偏移：当数据里的 |gx| < 阈值（基本平光）时把 spec 略偏到 lit 侧
+NECK_SHINE_FLAT_LIGHT_FALLBACK_FRAC = 0.04
+# 圆柱朝光面 SSS 软化系数（0=纯线性，1=完全 sqrt）：模拟皮肤次表面散射使光「绕过」曲面
+NECK_CYLINDER_SSS_ALPHA = 0.40
+
+# 解剖弱阴影：胸锁乳突肌（SCM）双侧斜向阴影带 + 中轴弱凸起（喉结/喉体），整体强度都很小，
+# 用 sin^2 余弦窗让它们在顶/底渐隐，避免穿过下颌或脖子底。
+NECK_ANATOMY_SCM_OFFSET_FRAC = 0.42  # SCM 中心相对圆柱半径 R 的横向偏移
+NECK_ANATOMY_SCM_SIGMA_FRAC = 0.10
+NECK_ANATOMY_SCM_DEPTH = 0.025  # 多大幅度的「压暗」（multiplier 减量）
+# 顶部/底部 SCM 的 V 形偏移（向外 spread）：模拟肌肉束从乳突到锁骨的走向
+NECK_ANATOMY_SCM_FLARE_FRAC = 0.18  # 自顶到底，SCM 中心向外多偏移 R 的多少
+NECK_ANATOMY_RIDGE_SIGMA_FRAC = 0.06
+NECK_ANATOMY_RIDGE_BRIGHT = 0.012  # 中轴凸起亮度提升（multiplier 增量），弱以适配男女
 # 脸部 V 对比度 → 圆柱 K / 高光强度缩放（平光弱、强侧光强）
 NECK_LIGHT_STRENGTH_LR_COEF = 2.0
 NECK_LIGHT_STRENGTH_RNG_COEF = 1.05
@@ -202,15 +249,49 @@ def skin_patch_rect_at(
     return x0, y0, pw, ph
 
 
+# 经典 YCrCb 肤色范围（多数文献：Cr∈[133,173], Cb∈[77,127]）；用于过滤 patch 内的非肤色像素
+# （眉毛、睫毛、痣、刘海阴影等），让中值/V 均值更稳定。过滤后若有效像素 < 阈值则回退到 alpha 过滤
+# 以避免极端肤色或高光被错误剔除。
+SKIN_YCRCB_CR_MIN, SKIN_YCRCB_CR_MAX = 133, 173
+SKIN_YCRCB_CB_MIN, SKIN_YCRCB_CB_MAX = 77, 127
+SKIN_FILTER_MIN_COUNT = 4
+
+
+def _patch_skin_alpha_mask(roi_bgra: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    返回 (alpha_mask, skin_mask)：均为 (h,w) bool。
+    - alpha_mask: roi 内 alpha > 40 的像素；
+    - skin_mask: alpha_mask & YCrCb 肤色范围内的像素。
+    若 skin_mask 像素数 < SKIN_FILTER_MIN_COUNT，调用方应回退用 alpha_mask。
+    """
+    am = roi_bgra[:, :, 3].astype(np.float32) > 40.0
+    bgr = roi_bgra[:, :, :3]
+    if bgr.size == 0:
+        return am, np.zeros_like(am, dtype=bool)
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    cr = ycrcb[:, :, 1]
+    cb = ycrcb[:, :, 2]
+    skin = (
+        (cr >= SKIN_YCRCB_CR_MIN) & (cr <= SKIN_YCRCB_CR_MAX) &
+        (cb >= SKIN_YCRCB_CB_MIN) & (cb <= SKIN_YCRCB_CB_MAX)
+    )
+    return am, am & skin
+
+
 def median_bgr_in_patch(bgra: np.ndarray, x0: int, y0: int, pw: int, ph: int) -> Optional[np.ndarray]:
-    """patch 内 alpha>40 的像素 BGR 各通道取中值；无有效像素返回 None。"""
+    """
+    patch 内 **alpha>40 ∩ YCrCb 肤色范围内** 的像素 BGR 各通道取中值；
+    若肤色过滤后像素数 < ``SKIN_FILTER_MIN_COUNT``，回退到仅 alpha 过滤；
+    仍无有效像素则返回 None。
+    """
     if pw <= 0 or ph <= 0:
         return None
     roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
-    m = roi[:, :, 3].astype(np.float32) > 40.0
-    if not np.any(m):
+    am, sm = _patch_skin_alpha_mask(roi)
+    if not np.any(am):
         return None
-    flat = roi[:, :, :3][m].astype(np.float64)
+    use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
+    flat = roi[:, :, :3][use].astype(np.float64)
     if flat.shape[0] == 0:
         return None
     return np.median(flat, axis=0)
@@ -219,20 +300,26 @@ def median_bgr_in_patch(bgra: np.ndarray, x0: int, y0: int, pw: int, ph: int) ->
 def mean_hsv_v_in_patch(
     bgra: np.ndarray, x0: int, y0: int, pw: int, ph: int
 ) -> Optional[float]:
-    """patch 内 alpha>40 像素 HSV 的 V 通道均值；无有效像素返回 None。"""
+    """
+    patch 内 **alpha>40 ∩ YCrCb 肤色范围内** 像素 HSV 的 V 均值；
+    肤色过滤过严时回退到仅 alpha；无有效像素返回 None。
+    """
     if pw <= 0 or ph <= 0:
         return None
     roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
-    m = roi[:, :, 3].astype(np.float32) > 40.0
-    if not np.any(m):
+    am, sm = _patch_skin_alpha_mask(roi)
+    if not np.any(am):
         return None
+    use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
     hsv = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2HSV)
-    v = hsv[:, :, 2].astype(np.float64)[m]
+    v = hsv[:, :, 2].astype(np.float64)[use]
+    if v.size == 0:
+        return None
     return float(np.mean(v))
 
 
 class FaceNeckLightParams(NamedTuple):
-    """由脸部局部 V 推断脖子光照：轴偏移、圆柱强度、高光、AO、肤色线性渐变系数。"""
+    """由脸部局部 V 推断脖子光照：轴偏移、圆柱强度、高光、AO、肤色线性渐变系数、光源方向。"""
 
     x_axis_shift: float
     spec_x_shift: float
@@ -242,6 +329,8 @@ class FaceNeckLightParams(NamedTuple):
     ao_top: float
     skin_grad_gx: float
     skin_grad_gy: float
+    # +1 表示主光从画面右侧来（lit 在右侧）；-1 表示从左侧；数据弱（平光）时回退 -1（与原硬编码兼容）。
+    light_sign: float = -1.0
 
 
 def estimate_face_lighting_for_neck(
@@ -252,35 +341,65 @@ def estimate_face_lighting_for_neck(
     R: float,
 ) -> FaceNeckLightParams:
     """
-    用与肤色采样一致的关键点小块 **HSV-V 均值** 估计照在脸上的光：
+    多点估光：在 ``LIGHT_SAMPLE_LANDMARKS`` 列出的左右颊 / 左右额 / 左右下颌 / 额中 / 下巴上
+    一共 8 个点采小块的 **HSV-V 均值**，对位置做 R 归一化后**最小二乘拟合 V = a + b*xn + c*yn**，
+    得到 2D 光梯度 ``(gx_norm, gy_norm)``：
 
-    - 左右颊(205/425) 推断 **横向** 来光（轴与高光带平移）；
-    - 额(10) 与下巴上(200) 推断 **上下** 分量，驱动脖子 albedo 的弱竖直渐变；
-    - ``|V_L-V_R|``、多块 V 的极差与标准差 → **对比度强度**，自适应缩放 ``K_LIT`` / ``K_SHADOW``、
-      高光强度（平光时减弱、强侧光或高反差时增强）；
-    - 双颊平均明显亮于下巴上区时略 **加强 AO**（颌下更贴重阴影照片）。
+    - ``gx_norm > 0``：右侧亮（光从右），``light_sign = +1``；反之 ``-1``；
+    - 圆柱轴 / 高光带 横向偏移：均与 ``gx_norm`` 同向（替代原"左右颊 V 差"单点近似）；
+    - 强度：用 8 点 V 的极差 + 标准差 + ``|gx_norm|`` 综合算 ``strength``；
+    - **取消** 原"默认主光偏左"硬偏置 ``NECK_SHINE_BASE_OFFSET_FRAC=0.15``；平光时 spec 居中，
+      仅当 ``|gx|`` 太小且 ``light_sign`` 仍 fallback 时给一点点 ``FLAT_LIGHT_FALLBACK`` 偏移；
+    - 上下分量 ``gy_norm`` 驱动脖子 albedo 的弱竖直渐变；
+    - 双颊平均明显亮于下巴上区时略加强 AO（颌下更贴重阴影照片）。
     """
     lm = landmarks.landmark
     Rf = float(max(R, 4.0))
 
-    def patch_v(lid: int, psize: int) -> Optional[float]:
+    samples: List[Tuple[int, float, float, float]] = []
+    for lid, _, psize in LIGHT_SAMPLE_LANDMARKS:
         cx, cy = landmark_xy(lm[lid], iw, ih)
         x0, y0, pw, ph = skin_patch_rect_at(cx, cy, ih, iw, psize)
-        return mean_hsv_v_in_patch(bgra, x0, y0, pw, ph)
+        v = mean_hsv_v_in_patch(bgra, x0, y0, pw, ph)
+        if v is not None:
+            samples.append((int(lid), float(cx), float(cy), float(v)))
+    by_lid = {s[0]: (s[1], s[2], s[3]) for s in samples}
 
-    vl = patch_v(205, SKIN_PATCH_CHEEK_PX)
-    vr = patch_v(425, SKIN_PATCH_CHEEK_PX)
-    vf = patch_v(10, SKIN_PATCH_OTHER_PX)
-    vu = patch_v(200, SKIN_PATCH_OTHER_PX)
+    if len(samples) >= 4:
+        xs = np.array([s[1] for s in samples], dtype=np.float64)
+        ys = np.array([s[2] for s in samples], dtype=np.float64)
+        vs = np.array([s[3] for s in samples], dtype=np.float64)
+        cx_face = float(np.mean(xs))
+        cy_face = float(np.mean(ys))
+        xn = (xs - cx_face) / Rf
+        yn = (ys - cy_face) / Rf
+        A = np.column_stack([np.ones_like(xn), xn, yn])
+        coef, *_ = np.linalg.lstsq(A, vs, rcond=None)
+        v_mean = float(np.mean(vs)) + 1e-3
+        gx_norm = float(np.clip(coef[1] / v_mean, -0.45, 0.45))
+        gy_norm = float(np.clip(coef[2] / v_mean, -0.45, 0.45))
+        v_std = float(np.std(vs))
+        v_rng = (float(np.max(vs)) - float(np.min(vs))) / 255.0
+    else:
+        # 数据太少，回退老路径（仅依赖左右颊 + 额/下巴上 V 差）
+        vl_t = by_lid.get(205, (None, None, None))[2]
+        vr_t = by_lid.get(425, (None, None, None))[2]
+        vf_t = by_lid.get(10, (None, None, None))[2]
+        vu_t = by_lid.get(200, (None, None, None))[2]
+        vals = [v for v in (vl_t, vr_t, vf_t, vu_t) if v is not None]
+        v_std = float(np.std(np.array(vals, dtype=np.float64))) if len(vals) >= 2 else 0.0
+        v_rng = (max(vals) - min(vals)) / 255.0 if len(vals) >= 2 else 0.0
+        if vl_t is not None and vr_t is not None:
+            denom = float(vl_t + vr_t) + 1e-3
+            gx_norm = float(np.clip((float(vr_t) - float(vl_t)) / denom, -0.28, 0.28))
+        else:
+            gx_norm = 0.0
+        if vf_t is not None and vu_t is not None:
+            gy_norm = float(np.clip((float(vu_t) - float(vf_t)) / 255.0, -0.22, 0.22))
+        else:
+            gy_norm = 0.0
 
-    vals = [float(v) for v in (vl, vr, vf, vu) if v is not None]
-    v_std = float(np.std(np.array(vals, dtype=np.float64))) if len(vals) >= 2 else 0.0
-    v_rng = (max(vals) - min(vals)) / 255.0 if len(vals) >= 2 else 0.0
-
-    lr_asym = 0.0
-    if vl is not None and vr is not None:
-        lr_asym = abs(float(vl) - float(vr)) / (float(vl) + float(vr) + 1e-3)
-
+    lr_asym = abs(gx_norm)
     strength = float(
         NECK_LIGHT_STRENGTH_MIN
         + float(NECK_LIGHT_STRENGTH_LR_COEF) * lr_asym
@@ -289,14 +408,16 @@ def estimate_face_lighting_for_neck(
     )
     strength = float(np.clip(strength, NECK_LIGHT_STRENGTH_MIN, NECK_LIGHT_STRENGTH_MAX))
 
-    if vl is None or vr is None:
-        axis_shift = 0.0
-        spec_shift = 0.0
+    # 主光方向：gx_norm > 0 表示右侧亮（光从右）→ light_sign = +1；反之 -1。
+    # 数据极弱（|gx| < 0.025）时 fallback 到 -1（保持与原硬编码"主光默认偏左"的视觉风格）。
+    if abs(gx_norm) >= 0.025:
+        light_sign = 1.0 if gx_norm > 0.0 else -1.0
     else:
-        denom = float(vl + vr) + 1e-3
-        dv = float(np.clip((float(vl) - float(vr)) / denom, -0.28, 0.28))
-        axis_shift = -float(NECK_LIGHT_AXIS_GAIN) * dv * Rf
-        spec_shift = -float(NECK_SHINE_TRACK_GAIN) * dv * Rf
+        light_sign = -1.0
+
+    # axis_shift / spec_shift 跟随 gx_norm 同向（光从右 gx_norm>0 → 偏移到右侧）
+    axis_shift = float(NECK_LIGHT_AXIS_GAIN) * gx_norm * Rf
+    spec_shift = float(NECK_SHINE_TRACK_GAIN) * gx_norm * Rf
 
     k_lit = float(NECK_CYLINDER_K_LIT) * strength
     k_shadow = float(NECK_CYLINDER_K_SHADOW) * strength
@@ -310,14 +431,17 @@ def estimate_face_lighting_for_neck(
     shine_k = float(NECK_SHINE_K) * shine_scale
 
     ao_top = float(NECK_CYLINDER_AO_TOP)
-    if vu is not None and vl is not None and vr is not None:
-        v_mid = 0.5 * (float(vl) + float(vr))
-        if v_mid > float(vu) + 4.0:
+    vl_e = by_lid.get(205, (None, None, None))[2]
+    vr_e = by_lid.get(425, (None, None, None))[2]
+    vu_e = by_lid.get(200, (None, None, None))[2]
+    if vu_e is not None and vl_e is not None and vr_e is not None:
+        v_mid = 0.5 * (float(vl_e) + float(vr_e))
+        if v_mid > float(vu_e) + 4.0:
             ao_top *= float(
                 np.clip(
                     1.0
                     + float(NECK_AO_CHIN_DARK_BOOST_COEF)
-                    * ((v_mid - float(vu)) / float(NECK_AO_CHIN_DARK_DIV)),
+                    * ((v_mid - float(vu_e)) / float(NECK_AO_CHIN_DARK_DIV)),
                     1.0,
                     1.45,
                 )
@@ -330,16 +454,8 @@ def estimate_face_lighting_for_neck(
         )
     )
 
-    skin_gx = 0.0
-    skin_gy = 0.0
-    if vl is not None and vr is not None:
-        skin_gx = float(
-            np.clip((float(vl) - float(vr)) / 255.0, -0.22, 0.22) * float(NECK_SKIN_GRAD_GAIN_LR)
-        )
-    if vf is not None and vu is not None:
-        skin_gy = float(
-            np.clip((float(vf) - float(vu)) / 255.0, -0.22, 0.22) * float(NECK_SKIN_GRAD_GAIN_FB)
-        )
+    skin_gx = float(np.clip(gx_norm, -0.22, 0.22) * float(NECK_SKIN_GRAD_GAIN_LR))
+    skin_gy = float(np.clip(-gy_norm, -0.22, 0.22) * float(NECK_SKIN_GRAD_GAIN_FB))
 
     return FaceNeckLightParams(
         x_axis_shift=axis_shift,
@@ -350,6 +466,7 @@ def estimate_face_lighting_for_neck(
         ao_top=ao_top,
         skin_grad_gx=skin_gx,
         skin_grad_gy=skin_gy,
+        light_sign=light_sign,
     )
 
 
@@ -398,7 +515,8 @@ def sample_skin_color_bgra(
     最后对合成 BGR 做 HSV 调整：V*=skin_v_scale（默认略压暗），S*=skin_s_scale（略加饱和），
     H+=skin_h_shift（向橙偏），共同模拟脖子相对脸部的「次表面散射偏暖偏暗略饱和」特征。
     """
-    skin_v_scale = float(np.clip(skin_v_scale, 0.90, 0.95))
+    # 注意：clamp 范围不能太紧，否则用户传 0.96/0.98 会被无声地拉回 0.95 造成"我调了它没动"。
+    skin_v_scale = float(np.clip(skin_v_scale, 0.85, 1.05))
     skin_h_shift = float(np.clip(skin_h_shift, -6.0, 6.0))
     skin_s_scale = float(np.clip(skin_s_scale, 0.90, 1.20))
     ih, iw = bgra.shape[:2]
@@ -420,6 +538,35 @@ def sample_skin_color_bgra(
     return _apply_neck_skin_tone(raw, skin_v_scale, skin_h_shift, skin_s_scale)
 
 
+def gather_lower_face_skin_pixels_bgr(
+    bgra: np.ndarray,
+    landmarks,
+    ih: int,
+    iw: int,
+    patch: int = NECK_TONE_REF_PATCH_PX,
+) -> np.ndarray:
+    """
+    收集 **下半脸**（双颊 / 人中 / 下巴上 / 双下颌角）肤色像素池作为颈部 Lab 色调匹配的参考分布。
+    刻意去掉额头与上颊：颈部物理上接的是「下颌-颈」区域而非额头；
+    若用整脸均值做参考，颈部会往往被误推往"额头偏白"那一侧，与下巴肤色不协调。
+    """
+    lm = landmarks.landmark
+    chunks: List[np.ndarray] = []
+    for lid in NECK_TONE_REF_LANDMARK_IDS:
+        cx, cy = landmark_xy(lm[lid], iw, ih)
+        x0, y0, pw, ph = skin_patch_rect_at(cx, cy, ih, iw, patch)
+        if pw <= 0 or ph <= 0:
+            continue
+        roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
+        am, sm = _patch_skin_alpha_mask(roi)
+        use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
+        if np.any(use):
+            chunks.append(roi[:, :, :3][use])
+    if not chunks:
+        return np.empty((0, 3), dtype=np.uint8)
+    return np.vstack(chunks)
+
+
 def gather_face_skin_pixels_bgr(
     bgra: np.ndarray,
     landmarks,
@@ -439,9 +586,10 @@ def gather_face_skin_pixels_bgr(
         if pw <= 0 or ph <= 0:
             continue
         roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
-        m = roi[:, :, 3].astype(np.float32) > 40.0
-        if np.any(m):
-            chunks.append(roi[:, :, :3][m])
+        am, sm = _patch_skin_alpha_mask(roi)
+        use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
+        if np.any(use):
+            chunks.append(roi[:, :, :3][use])
     if not chunks:
         return np.empty((0, 3), dtype=np.uint8)
     return np.vstack(chunks)
@@ -509,25 +657,129 @@ def estimate_face_luminance_grain_std(
     return max(stds)
 
 
+# 1/f 噪声 / Laplacian 锐度参考阈值。SHARP_REF 是经验值：
+# 大部分自然 8-bit 人像在 16x16 patch 上 |Laplacian| 均值 ~3-5；过强意味着图像很锐，过弱意味着糊。
+SHARP_REF = 4.0
+SHARP_FACTOR_MIN = 0.45
+SHARP_FACTOR_MAX = 1.55
+PINK_NOISE_ALPHA = 1.0  # 功率谱 ∝ 1/f^alpha；alpha=1 (1/f noise) 接近自然皮肤纹理频谱
+
+
+def generate_pink_noise_2d(
+    h: int,
+    w: int,
+    sigma: float,
+    alpha: float = PINK_NOISE_ALPHA,
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """
+    生成 (h, w) float32 的 1/f^alpha 噪声场（功率谱按频率倒数衰减），
+    最后归一化到目标标准差 ``sigma``。
+
+    与白噪声相比，pink noise 在中低频能量更强、空间相关性显著，
+    上叠在脖子皮肤上更接近真实皮肤"毛孔+细纹"的统计特性，而不是干净相机噪声。
+    """
+    rng = np.random.default_rng(seed)
+    white = rng.standard_normal((h, w)).astype(np.float32)
+    F = np.fft.fft2(white)
+    fx = np.fft.fftfreq(w).astype(np.float32)
+    fy = np.fft.fftfreq(h).astype(np.float32)
+    Fx, Fy = np.meshgrid(fx, fy)
+    radius = np.sqrt(Fx * Fx + Fy * Fy)
+    # 避免 DC 分量被无限放大；DC（频率=0）直接置 0
+    safe_r = np.where(radius > 0, radius, 1.0)
+    scale = (1.0 / safe_r) ** (alpha / 2.0)
+    scale = scale.astype(np.float32)
+    scale[0, 0] = 0.0
+    pink = np.real(np.fft.ifft2(F * scale)).astype(np.float32)
+    s = float(pink.std())
+    if s > 1e-6:
+        pink *= float(sigma) / s
+    return pink
+
+
+def estimate_face_high_freq_energy(
+    bgra: np.ndarray,
+    landmarks,
+    ih: int,
+    iw: int,
+) -> float:
+    """
+    在肤色采样块内对灰度做 Laplacian，取 ``|Lap|`` 在 alpha&肤色掩码下的均值，
+    各块之间取 **中位数**（比 max 更鲁棒，不会被一个极端 patch 拉偏）。
+
+    返回值越大表示原图越锐；用作 film grain σ 的额外缩放因子，
+    避免在被美颜/平滑过的图上把噪点叠得比脸还粗。
+    """
+    lm = landmarks.landmark
+    vals: List[float] = []
+    for lid, _, _, psize in SKIN_SAMPLE_REGIONS:
+        cx, cy = landmark_xy(lm[lid], iw, ih)
+        psize_use = max(int(psize), 12)
+        x0, y0, pw, ph = skin_patch_rect_at(cx, cy, ih, iw, psize_use)
+        if pw <= 0 or ph <= 0:
+            continue
+        roi = bgra[y0 : y0 + ph, x0 : x0 + pw]
+        am, sm = _patch_skin_alpha_mask(roi)
+        use = sm if int(np.sum(sm)) >= SKIN_FILTER_MIN_COUNT else am
+        if not np.any(use):
+            continue
+        gray = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+        vals.append(float(np.mean(np.abs(lap[use]))))
+    if not vals:
+        return SHARP_REF
+    return float(np.median(vals))
+
+
 def apply_film_grain_to_neck_bgra(
     neck_bgra: np.ndarray,
     face_grain_std: float,
     grain_gain: float = GRAIN_REF_GAIN_DEFAULT,
+    sharp_factor: float = 1.0,
+    use_pink_noise: bool = True,
+    seed: Optional[int] = None,
 ) -> np.ndarray:
     """
-    在脖子图层 **RGB** 上叠加微弱高斯白噪声（``cv2.randn``），**不改 alpha**。
-    标准差 ``sigma = clip(face_grain_std * grain_gain, GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX)``，
-    仅在 alpha>8 的像素上叠加，避免污染全透明区。
+    在脖子图层 **RGB** 上叠加微弱噪声（默认 **1/f pink noise**，3 通道独立），不改 alpha。
+
+    ``sigma = clip(face_grain_std * grain_gain * sharp_factor,
+                   GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX)``
+
+    其中 ``sharp_factor`` 由脸部 Laplacian 高频能量驱动（``estimate_face_high_freq_energy``），
+    平滑/美颜过的脸 sharp_factor 自动小于 1，避免脖子上叠出比脸更粗的颗粒。
     """
     gain = float(np.clip(grain_gain, 0.35, 2.5))
-    sigma = float(np.clip(face_grain_std * gain, GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX))
+    sf = float(np.clip(sharp_factor, SHARP_FACTOR_MIN, SHARP_FACTOR_MAX))
+    sigma = float(np.clip(face_grain_std * gain * sf, GRAIN_SIGMA_MIN, GRAIN_SIGMA_MAX))
     h, w = neck_bgra.shape[:2]
-    noise = np.zeros((h, w, 3), dtype=np.float32)
-    cv2.randn(noise, (0.0, 0.0, 0.0), (sigma, sigma, sigma))
-    m = (neck_bgra[:, :, 3].astype(np.float32) > 8.0)[:, :, np.newaxis]
-    rgb = neck_bgra[:, :, :3].astype(np.float32) + noise * m
     out = neck_bgra.copy()
-    out[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    # ROI：基于 alpha>8 的 bbox（脖子所在区域），只在该 ROI 内生成 noise，避免大图浪费
+    a_mask = neck_bgra[:, :, 3].astype(np.float32) > 8.0
+    if not np.any(a_mask):
+        return out
+    ys, xs = np.where(a_mask)
+    bx0 = max(0, int(xs.min()) - 4)
+    by0 = max(0, int(ys.min()) - 4)
+    bx1 = min(w, int(xs.max()) + 5)
+    by1 = min(h, int(ys.max()) + 5)
+    rh = by1 - by0
+    rw = bx1 - bx0
+
+    if use_pink_noise:
+        seed_val = seed if seed is not None else 0
+        noise = np.stack([
+            generate_pink_noise_2d(rh, rw, sigma, seed=seed_val + i * 7919)
+            for i in range(3)
+        ], axis=-1)
+    else:
+        noise = np.zeros((rh, rw, 3), dtype=np.float32)
+        cv2.randn(noise, (0.0, 0.0, 0.0), (sigma, sigma, sigma))
+    roi = neck_bgra[by0:by1, bx0:bx1]
+    m = (roi[:, :, 3].astype(np.float32) > 8.0)[:, :, np.newaxis]
+    rgb = roi[:, :, :3].astype(np.float32) + noise * m
+    out[by0:by1, bx0:bx1, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
     return out
 
 
@@ -618,6 +870,116 @@ def odd_kernel(size: int) -> int:
     if size % 2 == 0:
         size += 1
     return size
+
+
+# 用于 solvePnP 的标准 3D 人脸点（毫米单位，常见参考模型）：鼻尖、下巴、左右眼外角、左右嘴角
+HEAD_POSE_LANDMARKS = (1, 152, 33, 263, 61, 291)
+# 注意：image y 轴向下，所以 canonical Y 也用「向下为正」（与原文献的"向上为正"取负），
+# 这样 solvePnP 出来的 Euler 角与"图像 y-down"一致，正脸时 pitch≈0。
+HEAD_POSE_CANONICAL_3D = np.array([
+    [0.0,    0.0,    0.0],     # 鼻尖 (1)
+    [0.0,   63.6,  -12.5],     # 下巴 (152)，下巴在画面下方 → +Y
+    [-43.3, -32.7, -26.0],     # 左眼外角 (33)，眼睛在画面上方 → -Y
+    [43.3,  -32.7, -26.0],     # 右眼外角 (263)
+    [-28.9,  28.9, -24.1],     # 左嘴角 (61)
+    [28.9,   28.9, -24.1],     # 右嘴角 (291)
+], dtype=np.float64)
+
+# 姿态修正强度常量（弧度）
+POSE_PITCH_CHIN_OVERLAP_GAIN = 0.55     # chin_overlap *= clip(1 + gain * pitch, 0.55, 1.55)
+POSE_PITCH_CHIN_OVERLAP_MIN = 0.55
+POSE_PITCH_CHIN_OVERLAP_MAX = 1.55
+POSE_YAW_ASYM_INSET_GAIN = 0.30         # 顶边不对称 inset：远侧多 inset、近侧少 inset
+POSE_ROLL_MAX_RAD = 0.78                # ~45°，保护性 clip
+
+
+def estimate_head_pose(
+    landmarks,
+    w: int,
+    h: int,
+) -> Tuple[float, float, float]:
+    """
+    返回 ``(yaw, pitch, roll)``（弧度）。约定：
+    - yaw>0：头朝画面右侧转；
+    - pitch>0：仰头（颌下露出更多）；
+    - roll>0：头向画面右侧倾斜（眼线右端低于左端）。
+
+    采用混合策略：
+    1. **roll 必走"眼线角度"**——左眼 33 → 右眼 263 的方向角，几何上确定可靠，
+       不受 solvePnP 在 6 点退化情况下的影响；
+    2. **yaw / pitch 走 solvePnP**：6 个标准点 + 默认相机内参（fx=fy=w，主点=图像中心）；
+    3. 若 solvePnP 算出的 roll 与"眼线角度"差 >10°，认为求解器不稳定，
+       同步把 yaw / pitch 的幅度衰减 50%（保留方向）。
+
+    失败/退化时尽量返回 (0,0,roll_from_eye)，最差也能保证 roll 正确。
+    """
+    lm = landmarks.landmark
+    le = landmark_xy(lm[33], w, h)
+    re = landmark_xy(lm[263], w, h)
+    eye_dx = re[0] - le[0]
+    eye_dy = re[1] - le[1]
+    simple_roll = float(np.arctan2(eye_dy, eye_dx))
+
+    image_pts = np.array(
+        [landmark_xy(lm[i], w, h) for i in HEAD_POSE_LANDMARKS],
+        dtype=np.float64,
+    )
+    K = np.array(
+        [
+            [float(w), 0.0, float(w) * 0.5],
+            [0.0, float(w), float(h) * 0.5],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    dist = np.zeros((4, 1), dtype=np.float64)
+    yaw = 0.0
+    pitch = 0.0
+    pnp_roll = simple_roll
+    try:
+        success, rvec, _tvec = cv2.solvePnP(
+            HEAD_POSE_CANONICAL_3D, image_pts, K, dist,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+    except cv2.error:
+        success = False
+    if success:
+        Rmat, _ = cv2.Rodrigues(rvec)
+        sy = float(np.sqrt(Rmat[0, 0] ** 2 + Rmat[1, 0] ** 2))
+        if sy > 1e-6:
+            pnp_pitch = float(np.arctan2(Rmat[2, 1], Rmat[2, 2]))
+            pnp_yaw = float(np.arctan2(-Rmat[2, 0], sy))
+            pnp_roll = float(np.arctan2(Rmat[1, 0], Rmat[0, 0]))
+        else:
+            pnp_pitch = float(np.arctan2(-Rmat[1, 2], Rmat[1, 1]))
+            pnp_yaw = float(np.arctan2(-Rmat[2, 0], sy))
+            pnp_roll = 0.0
+        # image-y-down 下 solvePnP 的 pitch 是"低头为正"，反一下符号到"仰头为正"
+        yaw = pnp_yaw
+        pitch = -pnp_pitch
+        # 求解器与眼线角度差异 > 10° 视为退化，衰减 yaw / pitch
+        if abs(pnp_roll - simple_roll) > 0.175:
+            yaw *= 0.5
+            pitch *= 0.5
+
+    return (
+        float(np.clip(yaw, -POSE_ROLL_MAX_RAD, POSE_ROLL_MAX_RAD)),
+        float(np.clip(pitch, -POSE_ROLL_MAX_RAD, POSE_ROLL_MAX_RAD)),
+        float(np.clip(simple_roll, -POSE_ROLL_MAX_RAD, POSE_ROLL_MAX_RAD)),
+    )
+
+
+def rotate_xy(pts: np.ndarray, cx: float, cy: float, angle: float) -> np.ndarray:
+    """绕 (cx, cy) 旋转 (N,2) 点集；angle 弧度，正 = 画面 CCW（注意 OpenCV y 朝下，所以正向 = 顺时针视觉）。"""
+    if abs(float(angle)) < 1e-4:
+        return pts
+    c = float(np.cos(angle))
+    s = float(np.sin(angle))
+    dx = pts[:, 0] - float(cx)
+    dy = pts[:, 1] - float(cy)
+    nx = float(cx) + dx * c - dy * s
+    ny = float(cy) + dx * s + dy * c
+    return np.column_stack([nx, ny])
 
 
 def _face_oval_graph() -> dict[int, list[int]]:
@@ -726,12 +1088,23 @@ def build_jaw_guided_neck_polygon(
     return poly
 
 
-def fill_polygon_mask(h: int, w: int, poly: np.ndarray) -> np.ndarray:
-    """多边形内部 255，外部 0。"""
-    mask = np.zeros((h, w), dtype=np.uint8)
-    pts = np.round(poly).astype(np.int32).reshape(1, -1, 2)
-    cv2.fillPoly(mask, pts, 255, lineType=cv2.LINE_AA)
-    return mask
+def fill_polygon_mask(h: int, w: int, poly: np.ndarray, supersample: int = NECK_MASK_SUPERSAMPLE) -> np.ndarray:
+    """
+    多边形 mask（uint8，0~255）。``supersample > 1`` 时先在 ``SS×`` 分辨率上 ``fillPoly``，
+    再用 ``cv2.INTER_AREA`` 下采样得到边缘平滑的 AA mask（边界像素的 0/255 之间会有灰度过渡），
+    可显著消除"放大后两侧锯齿"的视觉问题。
+    """
+    if supersample <= 1:
+        mask = np.zeros((h, w), dtype=np.uint8)
+        pts = np.round(poly).astype(np.int32).reshape(1, -1, 2)
+        cv2.fillPoly(mask, pts, 255, lineType=cv2.LINE_AA)
+        return mask
+    H2 = h * int(supersample)
+    W2 = w * int(supersample)
+    mask_big = np.zeros((H2, W2), dtype=np.uint8)
+    pts_big = np.round(poly * float(supersample)).astype(np.int32).reshape(1, -1, 2)
+    cv2.fillPoly(mask_big, pts_big, 255, lineType=cv2.LINE_AA)
+    return cv2.resize(mask_big, (w, h), interpolation=cv2.INTER_AREA)
 
 
 def distance_map_to_polyline(h: int, w: int, pts: np.ndarray) -> np.ndarray:
@@ -754,6 +1127,20 @@ def distance_map_to_polyline(h: int, w: int, pts: np.ndarray) -> np.ndarray:
     return dt.astype(np.float64)
 
 
+NECK_SHADE_ROI_PADDING_PX = 12
+
+
+def _bbox_poly_padded(
+    poly: np.ndarray, h: int, w: int, pad: int
+) -> Tuple[int, int, int, int]:
+    """多边形 bbox + 像素 padding，并裁切到图像范围内。返回 (x0, y0, x1, y1)（半开区间）。"""
+    x0 = max(0, int(np.floor(np.min(poly[:, 0]))) - int(pad))
+    y0 = max(0, int(np.floor(np.min(poly[:, 1]))) - int(pad))
+    x1 = min(w, int(np.ceil(np.max(poly[:, 0]))) + int(pad) + 1)
+    y1 = min(h, int(np.ceil(np.max(poly[:, 1]))) + int(pad) + 1)
+    return x0, y0, x1, y1
+
+
 def neck_cylinder_shade_map(
     h: int,
     w: int,
@@ -765,58 +1152,117 @@ def neck_cylinder_shade_map(
     k_shadow: Optional[float] = None,
     shine_k: Optional[float] = None,
     ao_top: Optional[float] = None,
+    light_sign: float = -1.0,
+    sss_alpha: float = NECK_CYLINDER_SSS_ALPHA,
+    roll: float = 0.0,
+    roi_pad_px: int = NECK_SHADE_ROI_PADDING_PX,
 ) -> np.ndarray:
     """
     在整幅图上生成圆柱侧面亮度乘子 (h, w)。
 
-    - 水平：多边形 x 均值为轴，可叠加 ``x_axis_shift``（由左右颊亮度推断侧光）；``tanh`` 柔化径向；
-      **迎光侧**（画面左侧）用 ``k_lit`` 提亮，**背光侧**用 ``k_shadow`` 压暗（可由脸部对比度自适应）。
-    - 颌下 AO：到 **上沿折线**（``poly`` 前半链，对应下颌引导边）的距离变换，近颌弧压暗，
-      而非整条竖直线性带。
-    - 微弱水平高光带（``shine_k``），中心随 ``spec_x_shift`` 与轴一起平移。
-    - **mask 内对 L 做均值归一化到 1.0**，再 clip，避免整块脖子比采样肤色偏暗。
+    - **方向感知** 的 lit/sh：``light_sign=+1`` 表示主光从画面右侧（lit 在右），``-1`` 从左；
+      圆柱中线 = 多边形 x 均值 + ``x_axis_shift``；``tanh`` 柔化径向。
+    - **SSS 软化朝光面**：朝光侧 ``lit`` 不再是纯线性，而是 ``mix(lin, sqrt(lin), sss_alpha)``，
+      模拟皮肤次表面散射使光"绕过"曲面更多，过渡更软；背光侧保持线性（光不会绕到背面）。
+    - **双层高光**：窄 specular 峰（高频反射）+ 宽漫射 roll-off（皮肤主要还是漫反射），
+      能量按 ``NECK_SHINE_NARROW_SHARE`` 分配。中心位置为 ``x_axis + spec_x_shift``，
+      平光时再叠一点 ``light_sign * FLAT_LIGHT_FALLBACK_FRAC * R`` 偏置避免完全居中。
+    - 颌下 AO：到上沿折线的距离变换，近颌弧压暗。
+    - mask 内对 L 做均值归一化到 1.0，再 clip。
     """
     kL = float(NECK_CYLINDER_K_LIT if k_lit is None else k_lit)
     kS = float(NECK_CYLINDER_K_SHADOW if k_shadow is None else k_shadow)
     k_spec = float(NECK_SHINE_K if shine_k is None else shine_k)
     k_ao = float(NECK_CYLINDER_AO_TOP if ao_top is None else ao_top)
-    xx = np.arange(w, dtype=np.float64)[np.newaxis, :]
-    yy = np.arange(h, dtype=np.float64)[:, np.newaxis]
-    x_axis = float(np.mean(poly[:, 0])) + float(x_axis_shift)
-    span = float(np.max(poly[:, 0]) - np.min(poly[:, 0]))
+    sign = float(np.sign(light_sign)) if abs(light_sign) > 1e-3 else -1.0
+    sss_a = float(np.clip(sss_alpha, 0.0, 1.0))
+
+    # ROI：只在 polygon bbox + padding 内做 meshgrid / distanceTransform，省去整图大数组运算。
+    bx0, by0, bx1, by1 = _bbox_poly_padded(poly, h, w, roi_pad_px)
+    rh = by1 - by0
+    rw = bx1 - bx0
+    if rh < 4 or rw < 4:
+        return np.ones((h, w), dtype=np.float64)
+    poly_l = poly.copy()
+    poly_l[:, 0] -= float(bx0)
+    poly_l[:, 1] -= float(by0)
+    mask_l = mask[by0:by1, bx0:bx1]
+
+    xx = np.arange(rw, dtype=np.float64)[np.newaxis, :]
+    yy_g = np.arange(rh, dtype=np.float64)[:, np.newaxis]
+    x_axis = float(np.mean(poly_l[:, 0])) + float(x_axis_shift)
+    y_center = float(np.mean(poly_l[:, 1]))
+    span = float(np.max(poly_l[:, 0]) - np.min(poly_l[:, 0]))
     R = max(span * 0.5, 4.0)
-    radial = (xx - x_axis) / R
-    radial = np.clip(radial, -1.45, 1.45)
+    # roll 把圆柱整体绕 (x_axis, y_center) 倾斜：径向 / 高光的「水平」方向变成 (cos, sin) 矢量。
+    cos_r = float(np.cos(roll))
+    sin_r = float(np.sin(roll))
+    x_perp = (xx - x_axis) * cos_r + (yy_g - y_center) * sin_r
+    radial = np.clip(x_perp / R, -1.45, 1.45)
     rad_s = np.tanh(radial * float(NECK_CYLINDER_TANH_SCALE))
-    # rad_s<0 → 画面左侧：迎光；rad_s>0 → 背光
-    lit = np.maximum(0.0, -rad_s)
-    sh = np.maximum(0.0, rad_s)
-    L = 1.0 + kL * lit - kS * sh
-    y_min = float(np.min(poly[:, 1]))
-    y_max = float(np.max(poly[:, 1]))
+    # 方向感知：sign=+1 → lit 在右（rad_s>0）；sign=-1 → lit 在左（rad_s<0）
+    lit_lin = np.maximum(0.0, sign * rad_s)
+    sh_lin = np.maximum(0.0, -sign * rad_s)
+    # 朝光面 SSS 软化（sqrt-like 让光绕过曲面更多）；背光面保线性
+    lit = (1.0 - sss_a) * lit_lin + sss_a * np.sqrt(np.maximum(lit_lin, 0.0))
+    L = 1.0 + kL * lit - kS * sh_lin
+    y_min = float(np.min(poly_l[:, 1]))
+    y_max = float(np.max(poly_l[:, 1]))
     depth = max(y_max - y_min, 1.0)
-    # 窄条高光（乘性），中心在轴左侧一点并叠加 spec_x_shift
-    sig = max(R * float(NECK_SHINE_SIGMA_FRAC), 2.5)
-    x_spec = (
-        x_axis
-        - R * float(NECK_SHINE_BASE_OFFSET_FRAC)
-        + float(spec_x_shift)
-    )
-    shine = k_spec * np.exp(-0.5 * np.square((xx - x_spec) / sig))
+
+    # 双层高光：窄 specular + 宽 diffuse roll-off；中心位置在「旋转后径向 = 偏移量 / R」处
+    sig_n = max(R * float(NECK_SHINE_SIGMA_FRAC), 2.0)
+    sig_w = max(R * float(NECK_SHINE_DIFFUSE_SIGMA_FRAC), 4.0)
+    narrow_share = float(np.clip(NECK_SHINE_NARROW_SHARE, 0.0, 1.0))
+    # 平光（spec_x_shift 极小）时给一点点方向偏置，避免高光卡在轴中心显假
+    flat_fallback = 0.0
+    if abs(spec_x_shift) < 0.5 * R * float(NECK_SHINE_FLAT_LIGHT_FALLBACK_FRAC):
+        flat_fallback = sign * R * float(NECK_SHINE_FLAT_LIGHT_FALLBACK_FRAC)
+    spec_offset = float(spec_x_shift) + flat_fallback
+    spec_dist = x_perp - spec_offset
+    shine_n = (k_spec * narrow_share) * np.exp(-0.5 * np.square(spec_dist / sig_n))
+    shine_w = (k_spec * (1.0 - narrow_share)) * np.exp(-0.5 * np.square(spec_dist / sig_w))
+    shine = shine_n + shine_w
     L = L * (1.0 + shine)
-    n_up = max(poly.shape[0] // 2, 2)
-    upper = poly[:n_up].astype(np.float64)
-    dt = distance_map_to_polyline(h, w, upper)
+
+    n_up = max(poly_l.shape[0] // 2, 2)
+    upper = poly_l[:n_up].astype(np.float64)
+    dt = distance_map_to_polyline(rh, rw, upper)
     tau = max(depth * float(NECK_AO_DT_TAU_FRAC), float(NECK_AO_DT_TAU_MIN_PX))
     ao_w = np.exp(-dt / tau)
     L = L * (1.0 - k_ao * np.power(ao_w, 0.95))
-    wm = mask > 0
-    if np.any(wm):
-        mu = float(np.mean(L[wm]))
+
+    # 解剖弱修饰：双侧 SCM（胸锁乳突肌）阴影带 + 中轴弱凸起；与圆柱一同绕 roll 旋转。
+    # 沿"垂直"方向（旋转坐标 y_perp = -(xx-x_axis)*sin + (yy-y_center)*cos）计算 yn，
+    # 让 SCM 与中轴的"上下"始终对齐脖子主轴而不是图像 y 轴。
+    y_perp = -(xx - x_axis) * sin_r + (yy_g - y_center) * cos_r
+    half_h = max(depth * 0.5, 1.0)
+    yn = np.clip((y_perp / half_h) * 0.5 + 0.5, 0.0, 1.0)
+    vert_win = np.sin(np.pi * yn) ** 2
+    # SCM 横向位置随旋转后深度自顶到底向外略 flare（V 形）
+    scm_offset = R * (
+        float(NECK_ANATOMY_SCM_OFFSET_FRAC)
+        + float(NECK_ANATOMY_SCM_FLARE_FRAC) * yn
+    )
+    sig_scm = max(R * float(NECK_ANATOMY_SCM_SIGMA_FRAC), 1.5)
+    g_l = np.exp(-0.5 * np.square((x_perp - (-scm_offset)) / sig_scm))
+    g_r = np.exp(-0.5 * np.square((x_perp - (+scm_offset)) / sig_scm))
+    L = L * (1.0 - float(NECK_ANATOMY_SCM_DEPTH) * (g_l + g_r) * vert_win)
+    # 中轴凸起
+    sig_ridge = max(R * float(NECK_ANATOMY_RIDGE_SIGMA_FRAC), 1.0)
+    g_c = np.exp(-0.5 * np.square(x_perp / sig_ridge))
+    L = L * (1.0 + float(NECK_ANATOMY_RIDGE_BRIGHT) * g_c * vert_win)
+
+    wm_l = mask_l > 0
+    if np.any(wm_l):
+        mu = float(np.mean(L[wm_l]))
         L = L / max(mu, 1e-6)
     L = np.clip(L, float(NECK_CYLINDER_L_MIN), float(NECK_CYLINDER_L_MAX))
-    wm_f = wm.astype(np.float64)
-    return L * wm_f + (1.0 - wm_f)
+    wm_f = wm_l.astype(np.float64)
+    L_local = L * wm_f + (1.0 - wm_f)
+    L_full = np.ones((h, w), dtype=np.float64)
+    L_full[by0:by1, bx0:bx1] = L_local
+    return L_full
 
 
 def alpha_over(bottom: np.ndarray, top: np.ndarray) -> np.ndarray:
@@ -854,6 +1300,9 @@ def build_natural_neck_layer(
     jaw_span_px: Optional[float] = None,
     neck_depth_override_px: Optional[float] = None,
     tone_match_strength: float = NECK_TONE_MATCH_STRENGTH,
+    head_yaw: float = 0.0,
+    head_pitch: float = 0.0,
+    head_roll: float = 0.0,
 ) -> np.ndarray:
     """
     下颌引导多边形；mask 内 BGR = 采样肤色 × **局部线性肤色渐变** × **圆柱体明暗乘子**
@@ -883,10 +1332,40 @@ def build_natural_neck_layer(
     poly = build_jaw_guided_neck_polygon(
         landmarks, w, h, overlap, neck_depth, flare_slim, top_inset=top_inset
     )
+
+    # 姿态修正之 yaw：远离相机的一侧（与 yaw 同号）顶边再多 inset 一点（更窄），
+    # 近相机一侧少 inset，让脖子的"近-远"对比与脸部 yaw 一致。
+    if abs(head_yaw) > 1e-3:
+        n_top_y = poly.shape[0] // 2
+        top = poly[:n_top_y]
+        bot = poly[n_top_y:]
+        cx_top = float(np.mean(top[:, 0]))
+        # yaw>0（头朝右转）：左半（x<cx）更靠近相机 → 少 inset；右半（x>cx）远 → 多 inset
+        sign_dir = np.sign(top[:, 0] - cx_top)  # +1 right, -1 left
+        extra_factor = 1.0 - float(POSE_YAW_ASYM_INSET_GAIN) * float(head_yaw) * sign_dir
+        extra_factor = np.clip(extra_factor, 0.7, 1.3)
+        top[:, 0] = cx_top + (top[:, 0] - cx_top) * extra_factor
+        # 底边按同样比例做（保持顶底连续）
+        sign_b = np.sign(bot[:, 0] - cx_top)
+        extra_b = 1.0 - float(POSE_YAW_ASYM_INSET_GAIN) * float(head_yaw) * sign_b
+        extra_b = np.clip(extra_b, 0.7, 1.3)
+        bot[:, 0] = cx_top + (bot[:, 0] - cx_top) * extra_b
+        poly = np.vstack([top, bot])
+
+    # 姿态修正之 roll：绕下巴点旋转整个多边形
+    if abs(head_roll) > 1e-3:
+        chin_x_lm, chin_y_lm = landmark_xy(landmarks.landmark[LANDMARK_CHIN_BOTTOM], w, h)
+        poly = rotate_xy(poly, chin_x_lm, chin_y_lm, head_roll)
+        poly[:, 0] = np.clip(poly[:, 0], 0.0, float(w - 1))
+        poly[:, 1] = np.clip(poly[:, 1], 0.0, float(h - 1))
+
     mask = fill_polygon_mask(h, w, poly)
 
     skin = np.array(skin_bgr, dtype=np.float64)
-    wm = (mask > 0).astype(np.float64)
+    # 注意 mask 现在是 AA-edged uint8（超采样下采样后边界为 0~255 的灰度），
+    # wm_bool 用于 G 的归一化（>=1 视为内部即可，包含 AA 灰边一起算入分母不影响均值）。
+    wm = (mask.astype(np.float64) / 255.0)
+    wm_bool = mask >= 1
     span_x = float(np.max(poly[:, 0]) - np.min(poly[:, 0]))
     R_est = max(span_x * 0.5, 4.0)
     y_min = float(np.min(poly[:, 1]))
@@ -907,6 +1386,8 @@ def build_natural_neck_layer(
         k_shadow=light.k_shadow,
         shine_k=light.shine_k,
         ao_top=light.ao_top,
+        light_sign=light.light_sign,
+        roll=float(head_roll),
     )
     xx = np.arange(w, dtype=np.float64)[np.newaxis, :]
     yy = np.arange(h, dtype=np.float64)[:, np.newaxis]
@@ -916,10 +1397,12 @@ def build_natural_neck_layer(
         + light.skin_grad_gy * (cyn - yy) / max(depth_n, 1.0)
     )
     G = np.clip(G, 0.9, 1.12)
-    wm_b = wm > 0
-    if np.any(wm_b):
-        G = G / max(float(np.mean(G[wm_b])), 1e-6)
-    bgr = skin * L[:, :, np.newaxis] * G[:, :, np.newaxis] * wm[:, :, np.newaxis]
+    if np.any(wm_bool):
+        G = G / max(float(np.mean(G[wm_bool])), 1e-6)
+    # ★ 重要修复：不再 *wm。原写法把多边形外（但羽化 alpha>0 区）的 BGR 强制置 0，
+    # 与羽化 alpha 复合后产生显著的"暗 halo / 锯齿带"。L 在 mask 外恒等于 1（在 shade_map 里 wm_f 处理过），
+    # G 在 mask 外被 clip 到 [0.9,1.12]，因此 mask 外 bgr ≈ skin 本色，与 alpha 羽化平滑过渡，无暗边。
+    bgr = skin * L[:, :, np.newaxis] * G[:, :, np.newaxis]
 
     # 上沿折线（poly 前半段）—— 用作距离场，驱动 alpha 抑制 / 羽化
     n_up = max(poly.shape[0] // 2, 2)
@@ -942,24 +1425,124 @@ def build_natural_neck_layer(
     layer[:, :, 3] = alpha_f
     layer_u8 = np.clip(np.round(layer), 0, 255).astype(np.uint8)
 
-    # 颜色统计匹配：Reinhard Lab mean shift（仅迁移 mean，不动 std；保留圆柱明暗细节）
+    # 颜色统计匹配：Reinhard Lab mean shift（仅迁移 mean，不动 std；保留圆柱明暗细节）。
+    # 参考池用下半脸（双颊/人中/下巴上/下颌角），让脖子色调匹配「下颌-颈」连接处而不是整脸均值。
     if tone_match_strength > 0.0:
-        ref_pixels = gather_face_skin_pixels_bgr(bgra, landmarks, h, w, patch=22)
+        ref_pixels = gather_lower_face_skin_pixels_bgr(bgra, landmarks, h, w)
         match_mask = alpha_f > 8.0
         reinhard_lab_mean_shift_bgra_inplace(
             layer_u8, match_mask, ref_pixels, strength=float(tone_match_strength)
         )
 
-    # 距离驱动的 alpha 抑制：在脸部不透明区，越靠近下颌折线越压低脖子 alpha；越往脖子腹部越保留
+    # 距离驱动的 alpha 抑制：在脸部不透明区，越靠近下颌折线越压低脖子 alpha；越往脖子腹部越保留。
+    # 引入 gamma<1：对中间 α（脸部羽化边缘 0.3-0.7）也压得更猛，消除色相 halo。
     oa = bgra[:, :, 3].astype(np.float64) / 255.0
+    oa_gamma = np.power(oa, float(NECK_SUPPRESS_ALPHA_GAMMA))
     decay = float(max(span_for_scale * NECK_SUPPRESS_DECAY_FRAC, NECK_SUPPRESS_DECAY_MIN_PX))
     boundary_envelope = np.exp(-dt_upper / decay)
-    suppress = oa * boundary_envelope
+    suppress = oa_gamma * boundary_envelope
     layer_u8[:, :, 3] = np.clip(
         layer_u8[:, :, 3].astype(np.float64) * (1.0 - suppress), 0, 255
     ).astype(np.uint8)
 
     return layer_u8
+
+
+def estimate_existing_neck_extent_px(
+    bgra: np.ndarray,
+    chin_x: float,
+    chin_y: float,
+    jaw_span_px: float,
+) -> float:
+    """
+    沿 chin 下方一条 ±``COLLAR_PROBE_HALF_WIDTH_FRAC * jaw_span`` 宽的中心垂直条带，
+    测量 ``alpha > COLLAR_ALPHA_THRESHOLD`` 的连续延伸距离（自 chin_y 向下首个不达标行的位置）。
+    用于检测原图是否已经包含一段脖子 / 衣领；若 ``> jaw_span * COLLAR_DETECT_MIN_FRAC``，
+    上层应缩短假脖子的 ``neck_depth``，避免在已有内容上重复绘制。
+    """
+    h, w = bgra.shape[:2]
+    half = max(int(jaw_span_px * COLLAR_PROBE_HALF_WIDTH_FRAC), 4)
+    x0 = max(0, int(round(chin_x - half)))
+    x1 = min(w, int(round(chin_x + half)))
+    y_top = max(0, int(round(chin_y)))
+    y_bot = min(h, int(round(chin_y + jaw_span_px * COLLAR_PROBE_MAX_FRAC)))
+    if x1 <= x0 or y_bot <= y_top + 1:
+        return 0.0
+    strip_alpha = bgra[y_top:y_bot, x0:x1, 3]
+    row_med = np.median(strip_alpha, axis=1)
+    above = row_med > float(COLLAR_ALPHA_THRESHOLD)
+    if above.size == 0 or not bool(above[0]):
+        return 0.0
+    if bool(above.all()):
+        return float(above.size)
+    return float(int(np.argmin(above)))
+
+
+def make_face_mesh(
+    static_image_mode: bool = True,
+    max_num_faces: int = 1,
+    refine_landmarks: bool = True,
+    min_detection_confidence: float = 0.4,
+    min_tracking_confidence: float = 0.4,
+):
+    """
+    工厂函数：返回一个 MediaPipe FaceMesh 实例，便于在批量处理时复用同一个会话
+    （MediaPipe 模型加载本身有 ~100-300 ms 开销，复用可显著加速多图处理）。
+
+    使用方式：
+        with make_face_mesh() as fm:
+            for img in images:
+                bgra = ...
+                add_fake_neck(bgra, face_mesh=fm)
+    """
+    return mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=static_image_mode,
+        max_num_faces=max_num_faces,
+        refine_landmarks=refine_landmarks,
+        min_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=min_tracking_confidence,
+    )
+
+
+def _detect_first_face(face_mesh, rgb: np.ndarray):
+    """对外部传入的 FaceMesh 跑一次检测，返回第 1 张脸的 landmarks 或 None。"""
+    res = face_mesh.process(rgb)
+    if not res.multi_face_landmarks:
+        return None
+    return res.multi_face_landmarks[0]
+
+
+def detect_face_with_retry(rgb: np.ndarray):
+    """
+    带回退策略的人脸检测：
+    1. 先用默认参数（``min_detection_confidence=0.4``）跑一次；
+    2. 若失败、且图像最长边 < 1024，把图像放大到 ~1024 长边再跑（小头像友好）；
+    3. 若仍失败，把 ``min_detection_confidence`` 降到 0.2 再试一次（高遮挡/侧脸友好）；
+    4. 仍失败则返回 None。
+    """
+    h_img, w_img = rgb.shape[:2]
+    with make_face_mesh() as fm:
+        landmarks = _detect_first_face(fm, rgb)
+    if landmarks is not None:
+        return landmarks
+
+    longer = max(h_img, w_img)
+    if longer < 1024:
+        scale = 1024.0 / float(longer)
+        rh = int(round(h_img * scale))
+        rw = int(round(w_img * scale))
+        rgb_up = cv2.resize(rgb, (rw, rh), interpolation=cv2.INTER_LINEAR)
+        with make_face_mesh() as fm:
+            landmarks = _detect_first_face(fm, rgb_up)
+        if landmarks is not None:
+            return landmarks
+
+    with make_face_mesh(min_detection_confidence=0.2) as fm:
+        landmarks = _detect_first_face(fm, rgb)
+    if landmarks is not None:
+        return landmarks
+
+    return None
 
 
 def add_fake_neck(
@@ -968,7 +1551,7 @@ def add_fake_neck(
     neck_height_ratio: float = 0.26,
     chin_overlap_px: Optional[float] = None,
     neck_bottom_flare: float = 1.18,
-    skin_v_scale: float = 0.925,
+    skin_v_scale: float = 0.96,
     neck_slim_scale: float = NECK_SLIM_SCALE_DEFAULT,
     grain_gain: float = GRAIN_REF_GAIN_DEFAULT,
     neck_top_inset: float = NECK_TOP_INSET_DEFAULT,
@@ -976,6 +1559,9 @@ def add_fake_neck(
     skin_s_scale: float = NECK_SAT_SCALE_DEFAULT,
     tone_match_strength: float = NECK_TONE_MATCH_STRENGTH,
     auto_scale_by_jaw: bool = True,
+    pose_correction: bool = True,
+    face_mesh: Optional[object] = None,
+    use_pink_noise: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     核心流程（自然衔接版）：
@@ -1013,21 +1599,21 @@ def add_fake_neck(
     h, w = bgra.shape[:2]
     rgb = bgra_to_rgb(bgra)
 
-    mp_face_mesh = mp.solutions.face_mesh
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.4,
-        min_tracking_confidence=0.4,
-    ) as face_mesh:
-        results = face_mesh.process(rgb)
+    if face_mesh is not None:
+        landmarks = _detect_first_face(face_mesh, rgb)
+    else:
+        landmarks = None
+    if landmarks is None:
+        landmarks = detect_face_with_retry(rgb)
+    if landmarks is None:
+        raise RuntimeError(
+            "未检测到人脸：请确认图中包含完整面部且对比度正常。"
+            f" 当前图像 {w}x{h}，可尝试 (1) 提供更高分辨率原图；"
+            " (2) 检查抠图后人脸 alpha 是否完整未被裁切；"
+            " (3) 调小 min_detection_confidence。"
+        )
 
-    if not results.multi_face_landmarks:
-        raise RuntimeError("未检测到人脸，请确认图中包含完整面部且对比度正常。")
-
-    lm = results.multi_face_landmarks[0].landmark
-    landmarks = results.multi_face_landmarks[0]
+    lm = landmarks.landmark
     _, chin_y = landmark_xy(lm[LANDMARK_CHIN_BOTTOM], w, h)
 
     jaw_l_xy = landmark_xy(lm[LANDMARK_LEFT_JAW_ON_OVAL], w, h)
@@ -1055,6 +1641,37 @@ def add_fake_neck(
     else:
         depth_override = None
 
+    # 检测原图已有的脖子 / 衣领延伸（chin 下方中心条带 alpha 探查）；
+    # 若延伸明显，把假脖子深度按 (planned - existing) 缩短，仅填补空缺。
+    chin_x_px, chin_y_px = landmark_xy(lm[LANDMARK_CHIN_BOTTOM], w, h)
+    existing_extent = estimate_existing_neck_extent_px(
+        bgra, chin_x_px, chin_y_px, jaw_span,
+    )
+    if existing_extent > jaw_span * float(COLLAR_DETECT_MIN_FRAC):
+        if depth_override is not None:
+            depth_override = max(
+                COLLAR_DEPTH_SHRINK_MIN_PX,
+                depth_override - existing_extent * 0.7,
+            )
+        # 重叠也减小一点，避免假脖子顶贴着原有衣领的硬过渡
+        overlap = float(np.clip(
+            overlap * 0.7, JAW_SPAN_OVERLAP_MIN_PX, JAW_SPAN_OVERLAP_MAX_PX
+        ))
+
+    if pose_correction:
+        yaw_rad, pitch_rad, roll_rad = estimate_head_pose(landmarks, w, h)
+        # pitch 调 chin_overlap：仰头 (pitch>0) 颌下露出更多 → overlap 加大；俯首减小
+        pitch_scale = float(np.clip(
+            1.0 + POSE_PITCH_CHIN_OVERLAP_GAIN * pitch_rad,
+            POSE_PITCH_CHIN_OVERLAP_MIN, POSE_PITCH_CHIN_OVERLAP_MAX,
+        ))
+        overlap = float(np.clip(
+            overlap * pitch_scale,
+            JAW_SPAN_OVERLAP_MIN_PX, JAW_SPAN_OVERLAP_MAX_PX,
+        ))
+    else:
+        yaw_rad = pitch_rad = roll_rad = 0.0
+
     skin_bgr = sample_skin_color_bgra(
         bgra, landmarks, w, h,
         skin_v_scale=skin_v_scale,
@@ -1078,9 +1695,17 @@ def add_fake_neck(
         jaw_span_px=jaw_span,
         neck_depth_override_px=depth_override,
         tone_match_strength=tone_match_strength,
+        head_yaw=yaw_rad,
+        head_pitch=pitch_rad,
+        head_roll=roll_rad,
     )
     grain_ref = estimate_face_luminance_grain_std(bgra, landmarks, h, w)
-    neck_layer = apply_film_grain_to_neck_bgra(neck_layer, grain_ref, grain_gain=grain_gain)
+    sharp_energy = estimate_face_high_freq_energy(bgra, landmarks, h, w)
+    sharp_factor = float(np.clip(sharp_energy / SHARP_REF, SHARP_FACTOR_MIN, SHARP_FACTOR_MAX))
+    neck_layer = apply_film_grain_to_neck_bgra(
+        neck_layer, grain_ref, grain_gain=grain_gain,
+        sharp_factor=sharp_factor, use_pink_noise=use_pink_noise,
+    )
 
     composed = alpha_over(neck_layer, bgra)
     skin_marked = render_skin_sample_marked_preview(bgra, landmarks)
@@ -1138,8 +1763,9 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument(
         "--skin-v-scale",
         type=float,
-        default=0.925,
-        help="肤色采样后在 HSV 中 V 通道乘子，约 0.90–0.95（略压暗以贴合颌下阴影），默认 0.925",
+        default=0.96,
+        help="肤色采样后在 HSV 中 V 通道乘子（0.85–1.05）。"
+        "默认 0.96 ——颌下 AO 和圆柱阴影会再额外压暗 2-14%，0.925 时整体过暗",
     )
     parser.add_argument(
         "--neck-slim",
@@ -1164,19 +1790,19 @@ def main(argv: Optional[list] = None) -> int:
         "--skin-h-shift",
         type=float,
         default=NECK_HUE_SHIFT_DEFAULT,
-        help="肤色 HSV 中 H 偏移（OpenCV H∈[0,180]，正向橙偏），默认 1.6",
+        help="肤色 HSV 中 H 偏移（OpenCV H∈[0,180]，正向橙偏），默认 0.6（仅极轻 SSS 偏暖）",
     )
     parser.add_argument(
         "--skin-s-scale",
         type=float,
         default=NECK_SAT_SCALE_DEFAULT,
-        help="肤色 HSV 中 S 缩放（>1 略加饱和），默认 1.05",
+        help="肤色 HSV 中 S 缩放（>1 略加饱和），默认 1.02（极轻）",
     )
     parser.add_argument(
         "--tone-match",
         type=float,
         default=NECK_TONE_MATCH_STRENGTH,
-        help="Reinhard Lab 均值偏移强度（0=关，1=完全对齐脸部肤色均值），默认 0.40",
+        help="Reinhard Lab 均值偏移强度（0=关，1=完全对齐下半脸肤色均值），默认 0.65",
     )
     parser.add_argument(
         "--no-auto-scale",
@@ -1185,6 +1811,20 @@ def main(argv: Optional[list] = None) -> int:
         help="禁用按下颌跨度自适应；改用 --neck-height-ratio 等基于图高的硬编码相对量",
     )
     parser.set_defaults(auto_scale_by_jaw=True)
+    parser.add_argument(
+        "--no-pose-correction",
+        dest="pose_correction",
+        action="store_false",
+        help="禁用头部姿态（yaw/pitch/roll）校正：脖子永远垂直、对称、无 pitch overlap",
+    )
+    parser.set_defaults(pose_correction=True)
+    parser.add_argument(
+        "--white-noise",
+        dest="use_pink_noise",
+        action="store_false",
+        help="使用 cv2.randn 白噪声代替 1/f pink noise（默认 pink，更接近皮肤纹理）",
+    )
+    parser.set_defaults(use_pink_noise=True)
     args = parser.parse_args(argv)
 
     inp = os.path.abspath(args.input)
@@ -1211,6 +1851,8 @@ def main(argv: Optional[list] = None) -> int:
             skin_s_scale=float(np.clip(args.skin_s_scale, 0.90, 1.20)),
             tone_match_strength=float(np.clip(args.tone_match, 0.0, 1.0)),
             auto_scale_by_jaw=bool(args.auto_scale_by_jaw),
+            pose_correction=bool(args.pose_correction),
+            use_pink_noise=bool(args.use_pink_noise),
         )
     except Exception as e:
         print(f"[错误] {e}", file=sys.stderr)
