@@ -139,7 +139,8 @@ def sample_neck_anchor_skin_color(
 
 # Reinhard tone-match 的 ref pool 用「双颊主导 + 人中」，**不含下巴**（下巴常处于阴影会
 # 拉低 ref mean）。让 ref mean 尽量接近脸主体亮度，从而脖子色匹配真正的脸色而非下颌阴影色。
-NECK_REF_POOL_LANDMARKS: Tuple[int, ...] = (205, 425, 50, 280, 164)  # L 颊/R 颊/L 颊上/R 颊上/人中
+NECK_REF_POOL_LANDMARKS: Tuple[int, ...] = (10, 205, 425, 280, 164)
+# 实测脸最亮 5 点：额中 / 双颊 / 右颊上 / 人中。去掉了 50/67/297 等被头发阴影污染的点。
 
 
 def _gather_neck_ref_pixels(
@@ -196,9 +197,9 @@ QUILT_RNG_SEED = 12345
 # face_detail_tile 取脸颊 ROI 镜像平铺会把脸上的眼角/鼻翼阴影等大结构也带进 detail，
 # 在脖子上显出"漏斗形阴影"。改用 1/f pink noise 做 detail：频谱与真实皮肤毛孔接近
 # 但是纯合成纹理，**完全没有脸的结构污染**。强度参考 imagev2 实测 std≈11.7。
-PINK_NOISE_SIGMA = 8.0                    # 8 ≈ 真实皮肤 luminance 微变化幅度
-PINK_NOISE_ALPHA = 0.5                    # 1/f^0.5（接近白噪声但稍偏低频，更接近真实皮肤）
-PINK_NOISE_BLUR_SIGMA = 1.2               # blur 1.2px 让噪点显细腻（不显砂砾）
+PINK_NOISE_SIGMA = 4.5                    # imagev2 实测高频 std≈1，对应 sigma≈4-5
+PINK_NOISE_ALPHA = 0.3                    # 1/f^0.3 接近白噪声，能量集中在高频（细毛孔）
+PINK_NOISE_BLUR_SIGMA = 1.3               # 1.3px 让噪点细腻不显砂砾
 
 # --- Face Detail Tiling（旧路径，保留作可选）-----------------------------------------
 DETAIL_TILE_SIZE_FRAC = 0.20              # 0.45→0.20：更小 tile 减少非纹理结构混入
@@ -206,7 +207,7 @@ DETAIL_TILE_MIN_PX = 24
 DETAIL_TILE_MAX_PX = 80
 DETAIL_TILE_LANDMARKS = (205, 425, 10)
 DETAIL_INTENSITY_CLIP = 18.0
-DETAIL_EDGE_FEATHER_PX = 8
+DETAIL_EDGE_FEATHER_PX = 3                # 8→3：减少边缘"模糊感"，让 detail 接近边缘也保留
 
 # Mean-Match σ 必须 **远大于** detail tile 大小才能消除 tile 级色彩漂移；
 # 实测 σ ≥ tile_size 即可干净消除任何 tile 级低频差异。
@@ -608,8 +609,8 @@ def laplacian_band_blend(
 # Phase C: Alpha Matting （pymatting closed-form）
 # =====================================================================================
 
-MATTING_TRIMAP_ERODE_FRAC = 0.025
-MATTING_TRIMAP_DILATE_FRAC = 0.035
+MATTING_TRIMAP_ERODE_FRAC = 0.012   # 0.025→0.012：减小边缘软过渡带，让两侧不显"模糊"
+MATTING_TRIMAP_DILATE_FRAC = 0.018  # 0.035→0.018
 MATTING_BAND_PAD_PX = 24
 MATTING_MIN_BAND_PX = 6
 
@@ -951,16 +952,45 @@ def procedural_neck_init(
     R_est = max(span_x * 0.5, 4.0)
     light = estimate_face_lighting_for_neck(bgra, landmarks, h, w, R_est)
     if flat_shading:
-        # 平 shading：跳过 cylinder（避免 SCM/ridge），自己写颌下 AO + 自顶到底渐变。
-        # imagev2 实测脖子顶部（chin+15%）比中段（chin+50%）暗约 5%，所以 AO 最多 -8%。
+        # v1 自实现的轻度 cylinder shading（不带 SCM/ridge，避免显假）：
+        # (a) 颌下 AO：到上沿折线距离指数衰减（imagev2 实测顶部比中段暗 ~10%）
+        # (b) 横向 cylinder：中心比两侧亮 ~5%，模拟真实脖子的圆柱微立体感
+        # (c) 主光方向偏移：让 lit 一侧偏亮（imagev2 实测主光从右偏，亮度差~15）
         n_up_pre = max(poly.shape[0] // 2, 2)
         upper_pre = poly[:n_up_pre].astype(np.float64)
         dt_top = distance_map_to_polyline(h, w, upper_pre)
         depth_for_ao = max(float(np.max(poly[:, 1]) - np.min(poly[:, 1])), 1.0)
         tau_ao = max(depth_for_ao * 0.22, 8.0)
         ao_w = np.exp(-dt_top / tau_ao)
-        L = 1.0 - 0.08 * ao_w  # 颌下最多压 8%（之前 3% 太弱）
-        wm_f = (mask >= 1).astype(np.float64)
+
+        # 横向 cylinder：用 tanh 让中央亮、两侧渐暗
+        xx = np.arange(w, dtype=np.float64)[None, :]
+        x_axis = float(np.mean(poly[:, 0]))
+        span_x = float(np.max(poly[:, 0]) - np.min(poly[:, 0]))
+        R_cyl = max(span_x * 0.5, 4.0)
+        radial = (xx - x_axis) / R_cyl  # 中央 0，两边 ±1
+        radial = np.clip(radial, -1.4, 1.4)
+        # 中央亮（绝对值小→1），两侧暗（绝对值大→0）；rad_curve ∈ [0, 1]
+        rad_curve = 1.0 - np.tanh(np.abs(radial) * 1.4) ** 1.6
+        # 主光偏右：右侧再加 ~3% 亮，左侧减 ~3%
+        light_dir = np.tanh(radial * 0.9)  # 右 +1，左 -1（保持 ndarray）
+        cyl_intensity = 0.06  # 中央比两侧亮 6%
+        light_dir_intensity = 0.03  # 右侧再加 3%
+        # 形成 lateral L: [0.97 - 3%, 0.97 + 3% + cyl_at_center]
+        L_lat = 1.0 + cyl_intensity * (rad_curve - 0.5) + light_dir_intensity * light_dir
+
+        # AO: 颌下指数衰减
+        L_ao = 1.0 - 0.08 * ao_w
+
+        # 合成
+        L = L_lat * L_ao
+        # mask 内归一化到 mean=1，避免整体变暗/变亮
+        wm_bool_local = mask >= 1
+        if np.any(wm_bool_local):
+            mu_L = float(np.mean(L[wm_bool_local]))
+            L = L / max(mu_L, 1e-6)
+        L = np.clip(L, 0.85, 1.15)
+        wm_f = wm_bool_local.astype(np.float64)
         L = L * wm_f + (1.0 - wm_f)
     else:
         cs = float(np.clip(cylinder_strength, 0.0, 1.0))
