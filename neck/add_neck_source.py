@@ -80,7 +80,10 @@ NECK_FEATHER_MIN_PX = 1.5
 NECK_FEATHER_MAX_PX = 16.0
 NECK_SUPPRESS_DECAY_FRAC = 0.06
 NECK_SUPPRESS_DECAY_MIN_PX = 4.0
-NECK_SUPPRESS_ALPHA_GAMMA = 0.55
+# 抑制曲线：仅当 head_alpha ≥ NECK_SUPPRESS_OPAQUE_THRESH 时才参与抑制；
+# 在 [thresh, 1.0] 上做 smoothstep，避免在 head 的 alpha falloff（半透明
+# 抗锯齿过渡区）误压脖子的 alpha，从而消除头-颈衔接处的纵向缝隙。
+NECK_SUPPRESS_OPAQUE_THRESH = 0.85
 
 POSE_PITCH_CHIN_OVERLAP_GAIN = 0.55
 POSE_PITCH_CHIN_OVERLAP_MIN = 0.55
@@ -838,6 +841,11 @@ class NeckSourceTransplant:
     use_segmenter : bool
         是否使用 MediaPipe Selfie Multiclass Segmenter（CPU 模型）做精准的皮肤分割。
         默认 True；模型不可用 / 下载失败时自动回退到颜色启发式。
+    use_seg_mask : bool
+        是否用 segmenter 派生的真实脖子轮廓直接作为合成掩码（替代基于下颌 landmark
+        的 procedural 多边形掩码）。默认 True，仅在 ``use_segmenter`` 同时为 True
+        且模型可用时生效。可解决 mediapipe 下颌 landmark 偶有几像素误差导致 procedural
+        多边形把真实脖子切掉一块的问题。
     segmenter_model_path : str or None
         显式指定 ``selfie_multiclass_256x256.tflite`` 的本地路径；
         留空时自动从 ``models/`` 或 ``~/.cache/add_neck_source/`` 加载，
@@ -859,6 +867,7 @@ class NeckSourceTransplant:
         skin_s_scale: float = 1.0,
         tone_match_strength: float = TRANSPLANT_TONE_MATCH_STRENGTH,
         use_segmenter: bool = True,
+        use_seg_mask: bool = True,
         segmenter_model_path: Optional[str] = None,
         debug_dir: Optional[str] = None,
     ):
@@ -873,6 +882,7 @@ class NeckSourceTransplant:
         self.skin_s_scale = skin_s_scale
         self.tone_match_strength = float(np.clip(tone_match_strength, 0.0, 1.0))
         self.use_segmenter = bool(use_segmenter)
+        self.use_seg_mask = bool(use_seg_mask)
         self.segmenter_model_path = (
             os.path.abspath(segmenter_model_path) if segmenter_model_path else None
         )
@@ -1172,6 +1182,33 @@ class NeckSourceTransplant:
                 skin_w_map,
             )
 
+        # ============ Mask 来源切换：以 segmenter 真实轮廓为准 ============
+        # 用 segmenter 派生的脖子掩码替换原 procedural 多边形掩码。
+        # 解决 mediapipe 下颌 landmark（172/397）有几像素误差导致 procedural
+        # 多边形把真实脖子切掉一块的问题。procedural poly / top_h 仍保留：
+        # - top_h 用作 alpha-suppress 的"上沿参考线"
+        # - poly 用作 procedural 光照（_procedural_neck_layer）的几何参考
+        if seg_used and self.use_seg_mask:
+            # 桥接缓冲区：让 mask 二值边缘比 head 不透明区底沿再往上 buffer_px
+            # 个像素，这样 _feather_alpha（sigma ~ jaw_span * 0.025）羽化到
+            # head 的 alpha falloff 处时已接近全不透明，避免衔接缝隙。
+            top_bridge_buffer_px = int(round(max(head_jaw_span * 0.06, 6.0)))
+            seg_neck_mask_h = self._compute_seg_neck_mask_in_head_space(
+                seg_skin_src,
+                chin_s_x=chin_s_x, chin_s_y=chin_s_y,
+                overlap_s=overlap_s,
+                affine_M32=affine_M32,
+                head_w=w, head_h=h,
+                max_neck_depth_s=neck_depth_s,
+                head_alpha_u8=head_bgra[:, :, 3],
+                top_bridge_buffer_px=top_bridge_buffer_px,
+            )
+            if seg_neck_mask_h is not None and int((seg_neck_mask_h > 0).sum()) > 200:
+                if self.debug_dir is not None:
+                    self._debug_img("neck_mask_seg", seg_neck_mask_h)
+                mask_u8 = seg_neck_mask_h
+                mask_bool = mask_u8 >= 1
+
         # 把 warped 多边形内部的"非皮肤"像素（衣领/头发等）用周围真实皮肤纹理 inpaint 出去，
         # 让左右两侧都拥有 source 真皮肤的色彩 + 纹理，避免一侧被 procedural 平面色填充而显得"缺一块"。
         warped_filled = self._inpaint_non_skin(
@@ -1254,6 +1291,123 @@ class NeckSourceTransplant:
         skin = np.array(skin_bgr, dtype=np.float64)
         bgr = np.tile(skin[None, None, :], (h, w, 1)) * L[:, :, np.newaxis]
         return np.clip(np.round(bgr), 0, 255).astype(np.uint8)
+
+    # ---- internal: segmenter-derived mask --------------------------------------
+
+    @staticmethod
+    def _compute_seg_neck_mask_in_head_space(
+        source_skin_mask: np.ndarray,
+        chin_s_x: float, chin_s_y: float,
+        overlap_s: float,
+        affine_M32: np.ndarray,
+        head_w: int, head_h: int,
+        max_neck_depth_s: Optional[float] = None,
+        head_alpha_u8: Optional[np.ndarray] = None,
+        top_bridge_buffer_px: int = 6,
+    ) -> Optional[np.ndarray]:
+        """从 source 空间的皮肤掩码（segmenter 输出）派生「脖子」掩码并 affine 到 head 空间。
+
+        步骤：
+        1. 在 source 空间裁掉下颌之上的部分（仅保留 ``y >= chin_s_y - overlap_s`` 的皮肤）
+        2. 取包含下颌点的最大连通分量（过滤掉孤立的耳朵 / 别的皮肤区）
+        3. 形态学闭合 + 高斯平滑得到光滑边界
+        4. （可选）按 ``max_neck_depth_s`` 限制纵向最大深度
+        5. 用 ``affine_M32`` 映射到 head 空间
+        6. （可选，``head_alpha_u8`` 提供时）按列把 mask 顶端"桥接"到头部不透明区底沿，
+           让 mask 与 head 的 alpha falloff 完全重叠，消除衔接处的纵向缝隙
+        7. 平滑 + 二值化
+
+        返回 (H,W) uint8 掩码（255=neck，0=外）；输入失效时返回 None。
+        """
+        if source_skin_mask is None:
+            return None
+        if not np.any(source_skin_mask):
+            return None
+        sH, sW = source_skin_mask.shape[:2]
+
+        cut_y = max(0, int(round(chin_s_y - overlap_s)))
+        seg_neck = np.zeros((sH, sW), dtype=np.uint8)
+        seg_neck[cut_y:] = (source_skin_mask[cut_y:].astype(np.uint8)) * 255
+        if max_neck_depth_s is not None:
+            bot_cut = min(sH, int(round(chin_s_y + float(max_neck_depth_s))))
+            if bot_cut < sH:
+                seg_neck[bot_cut:] = 0
+        if not np.any(seg_neck):
+            return None
+
+        # 取包含下颌点正下方那一像素的连通分量
+        n_lab, labels = cv2.connectedComponents(seg_neck)
+        if n_lab <= 1:
+            return None
+        cy_pick = int(np.clip(int(round(chin_s_y)) + 1, cut_y + 1, sH - 1))
+        cx_pick = int(np.clip(int(round(chin_s_x)), 0, sW - 1))
+        target_label = int(labels[cy_pick, cx_pick])
+        if target_label == 0:
+            # 没命中下颌正下方，则取面积最大的非零分量（通常就是脖子主体）
+            best, best_area = 0, 0
+            for k in range(1, n_lab):
+                a = int((labels == k).sum())
+                if a > best_area:
+                    best_area = a
+                    best = k
+            target_label = best
+        if target_label == 0:
+            return None
+        seg_neck = ((labels == target_label).astype(np.uint8)) * 255
+
+        kernel = np.ones((3, 3), np.uint8)
+        seg_neck = cv2.morphologyEx(seg_neck, cv2.MORPH_CLOSE, kernel, iterations=2)
+        seg_neck_blur = cv2.GaussianBlur(seg_neck.astype(np.float32), (7, 7), 1.8)
+        seg_neck = (seg_neck_blur >= 100).astype(np.uint8) * 255
+
+        mask_h = cv2.warpAffine(
+            seg_neck, affine_M32, (head_w, head_h),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        mask_h_bin = (mask_h >= 64).astype(np.uint8) * 255
+
+        # 用 head 的 alpha 桥接：对每个有 seg 的列，把 mask 顶端延伸到
+        # 头部不透明区域底沿（alpha>=240 的最后一行）的上方 ``top_bridge_buffer_px``
+        # 像素处，确保 mask 与 head 的 alpha falloff 区域完全重叠，并给
+        # 后续 ``_feather_alpha`` 留够缓冲带 —— 这样羽化在 head 的不透明
+        # 边沿处已经接近 1.0，不会再有"头部已透明但脖子 alpha 还没爬起来"
+        # 的纵向缝隙。
+        # 桥接区少量入侵 head 不透明区是有意为之：``_suppress_overlap_alpha``
+        # 会按 head_alpha + 距上沿距离衰减，确实把这块的 neck alpha 压回去，
+        # 不会真正遮住下颌线条。
+        if head_alpha_u8 is not None and head_alpha_u8.shape == mask_h_bin.shape:
+            H, W = mask_h_bin.shape
+            mask_bool = mask_h_bin > 0
+            any_seg = mask_bool.any(axis=0)
+            if any_seg.any():
+                seg_top_per_col = np.argmax(mask_bool, axis=0).astype(np.int32)
+
+                head_solid = head_alpha_u8 >= 240
+                any_head_solid = head_solid.any(axis=0)
+                head_solid_bot_per_col = (
+                    H - 1 - np.argmax(head_solid[::-1, :], axis=0)
+                ).astype(np.int32)
+
+                buffer_px = max(int(top_bridge_buffer_px), 0)
+                fill_from = np.maximum(
+                    head_solid_bot_per_col - buffer_px, np.int32(0),
+                )
+                fill_to = seg_top_per_col
+                applicable = any_seg & any_head_solid & (fill_from < fill_to)
+                if applicable.any():
+                    y_coords = np.arange(H, dtype=np.int32)[:, None]
+                    in_range = (
+                        (y_coords >= fill_from[None, :])
+                        & (y_coords < fill_to[None, :])
+                    )
+                    to_fill = in_range & applicable[None, :]
+                    mask_h_bin[to_fill] = 255
+
+        mask_h_smooth = cv2.GaussianBlur(
+            mask_h_bin.astype(np.float32), (5, 5), 1.2,
+        )
+        mask_h_out = (mask_h_smooth >= 64).astype(np.uint8) * 255
+        return mask_h_out
 
     # ---- internal: transplant blend ------------------------------------------
 
@@ -1344,7 +1498,13 @@ class NeckSourceTransplant:
         decay = float(max(jaw_span * NECK_SUPPRESS_DECAY_FRAC, NECK_SUPPRESS_DECAY_MIN_PX))
         boundary_envelope = np.exp(-dt_upper / decay)
         oa = head_bgra[:, :, 3].astype(np.float64) / 255.0
-        suppress = np.power(oa, NECK_SUPPRESS_ALPHA_GAMMA) * boundary_envelope
+        # smoothstep: oa <= thresh -> 0（不抑制），oa = 1.0 -> 1（满抑制）。
+        # 这样仅在 head 真正不透明的区域防止脖子叠盖，落在 head 的 alpha
+        # falloff（半透明）区时不抑制，避免衔接缝隙。
+        thresh = float(NECK_SUPPRESS_OPAQUE_THRESH)
+        oa_norm = np.clip((oa - thresh) / max(1.0 - thresh, 1e-6), 0.0, 1.0)
+        oa_factor = oa_norm * oa_norm * (3.0 - 2.0 * oa_norm)
+        suppress = oa_factor * boundary_envelope
         return np.clip(alpha * (1.0 - suppress), 0.0, 1.0)
 
     @staticmethod
@@ -1389,6 +1549,10 @@ def main(argv: Optional[list] = None) -> int:
         help="关闭 MediaPipe Selfie 分割模型，回退到颜色启发式。",
     )
     parser.add_argument(
+        "--no-seg-mask", dest="use_seg_mask", action="store_false",
+        help="关闭『以 segmenter 真实轮廓替代 landmark 多边形』，回退到下颌 landmark 多边形。",
+    )
+    parser.add_argument(
         "--segmenter-model", default=None,
         help="可选：本地 selfie_multiclass_256x256.tflite 路径；不填则自动下载到 models/ 缓存。",
     )
@@ -1396,7 +1560,10 @@ def main(argv: Optional[list] = None) -> int:
         "--debug", default=None,
         help="启用调试输出：将每一步中间图片保存到指定目录",
     )
-    parser.set_defaults(pose_correction=True, auto_scale_by_jaw=True, use_segmenter=True)
+    parser.set_defaults(
+        pose_correction=True, auto_scale_by_jaw=True,
+        use_segmenter=True, use_seg_mask=True,
+    )
     args = parser.parse_args(argv)
 
     if args.output:
@@ -1420,6 +1587,7 @@ def main(argv: Optional[list] = None) -> int:
         skin_s_scale=args.skin_s_scale,
         tone_match_strength=args.tone_match_strength,
         use_segmenter=args.use_segmenter,
+        use_seg_mask=args.use_seg_mask,
         segmenter_model_path=args.segmenter_model,
         debug_dir=args.debug,
     )
