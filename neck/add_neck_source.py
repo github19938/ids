@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import urllib.request
 from collections import deque
 from typing import List, Optional, Tuple
 
@@ -105,6 +106,20 @@ COLLAR_DEPTH_SHRINK_MIN_PX = 12.0
 COLLAR_PROBE_HALF_WIDTH_FRAC = 0.18
 COLLAR_PROBE_MAX_FRAC = 2.0
 COLLAR_ALPHA_THRESHOLD = 128
+
+# MediaPipe Selfie Multiclass Segmenter（CPU 上的"皮肤/衣服/头发"语义分割）
+# 类别：0=background, 1=hair, 2=body-skin, 3=face-skin, 4=clothes, 5=others/accessories
+SELFIE_MULTICLASS_URL = (
+    "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+    "selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
+)
+SELFIE_MULTICLASS_FILENAME = "selfie_multiclass_256x256.tflite"
+SELFIE_CLASS_BACKGROUND = 0
+SELFIE_CLASS_HAIR = 1
+SELFIE_CLASS_BODY_SKIN = 2
+SELFIE_CLASS_FACE_SKIN = 3
+SELFIE_CLASS_CLOTHES = 4
+SELFIE_CLASS_OTHERS = 5
 
 
 # =====================================================================================
@@ -685,6 +700,112 @@ def _reinhard_lab_mean_shift(
 
 
 # =====================================================================================
+# Selfie Multiclass Segmenter — 用 CPU 模型做精准的皮肤/衣服分割
+# =====================================================================================
+
+def _default_model_cache_dir() -> str:
+    """模型缓存目录：脚本同目录的 ``models/`` 优先；否则 ``~/.cache/add_neck_source``。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(here, "models")
+    try:
+        os.makedirs(candidate, exist_ok=True)
+        if os.access(candidate, os.W_OK):
+            return candidate
+    except OSError:
+        pass
+    home = os.path.expanduser("~")
+    fallback = os.path.join(home, ".cache", "add_neck_source")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+def _ensure_selfie_multiclass_model(
+    model_path: Optional[str] = None, timeout: float = 30.0,
+) -> Optional[str]:
+    """确保 ``selfie_multiclass_256x256.tflite`` 模型存在，必要时联网下载。
+
+    返回模型本地绝对路径；下载失败时返回 ``None``。"""
+    if model_path:
+        if os.path.exists(model_path):
+            return os.path.abspath(model_path)
+    target_dir = _default_model_cache_dir()
+    target = os.path.join(target_dir, SELFIE_MULTICLASS_FILENAME)
+    if os.path.exists(target) and os.path.getsize(target) > 100 * 1024:
+        return target
+    try:
+        print(f"[selfie] 下载模型到 {target} ...", file=sys.stderr)
+        with urllib.request.urlopen(SELFIE_MULTICLASS_URL, timeout=timeout) as resp:
+            data = resp.read()
+        if not data or len(data) < 100 * 1024:
+            return None
+        tmp = target + ".part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, target)
+        return target
+    except Exception as e:  # noqa: BLE001
+        print(f"[selfie] 下载失败：{e}", file=sys.stderr)
+        return None
+
+
+def _make_selfie_segmenter(model_path: str):
+    """创建 MediaPipe Tasks ImageSegmenter 实例（IMAGE 模式，category mask）。
+
+    通过 ``model_asset_buffer`` 传入模型字节，规避 MediaPipe 在 Windows 上
+    将绝对路径误当成相对路径处理的问题。
+    """
+    from mediapipe.tasks.python import BaseOptions  # type: ignore
+    from mediapipe.tasks.python.vision import (  # type: ignore
+        ImageSegmenter, ImageSegmenterOptions, RunningMode,
+    )
+    with open(model_path, "rb") as f:
+        model_bytes = f.read()
+    options = ImageSegmenterOptions(
+        base_options=BaseOptions(model_asset_buffer=model_bytes),
+        running_mode=RunningMode.IMAGE,
+        output_category_mask=True,
+        output_confidence_masks=False,
+    )
+    return ImageSegmenter.create_from_options(options)
+
+
+def segment_skin_mask(
+    bgr_or_bgra: np.ndarray, model_path: Optional[str] = None,
+    include_face: bool = True, include_body: bool = True,
+) -> Optional[np.ndarray]:
+    """对单张图执行 Selfie Multiclass Segmentation，返回 ``(H,W) bool`` 皮肤掩码。
+
+    - ``include_face=True`` 时把 face-skin (类别 3) 算作皮肤
+    - ``include_body=True`` 时把 body-skin (类别 2) 算作皮肤
+    - 模型不可用时返回 ``None``，调用方应回退到颜色启发式。
+    """
+    mp_path = _ensure_selfie_multiclass_model(model_path)
+    if mp_path is None:
+        return None
+    if bgr_or_bgra.ndim != 3:
+        return None
+    if bgr_or_bgra.shape[2] == 4:
+        bgr = bgr_or_bgra[:, :, :3]
+    else:
+        bgr = bgr_or_bgra
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    try:
+        with _make_selfie_segmenter(mp_path) as seg:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = seg.segment(mp_image)
+        cat = result.category_mask.numpy_view()  # uint8 (H,W)
+    except Exception as e:  # noqa: BLE001
+        print(f"[selfie] 分割失败：{e}", file=sys.stderr)
+        return None
+    skin = np.zeros(cat.shape, dtype=bool)
+    if include_face:
+        skin |= cat == SELFIE_CLASS_FACE_SKIN
+    if include_body:
+        skin |= cat == SELFIE_CLASS_BODY_SKIN
+    return skin
+
+
+# =====================================================================================
 # NeckSourceTransplant — 主类
 # =====================================================================================
 
@@ -714,8 +835,15 @@ class NeckSourceTransplant:
         肤色 S 缩放（0.90-1.20）。默认 1.0。
     tone_match_strength : float
         transplant 后颜色对齐强度（0-1）。默认 0.30。
+    use_segmenter : bool
+        是否使用 MediaPipe Selfie Multiclass Segmenter（CPU 模型）做精准的皮肤分割。
+        默认 True；模型不可用 / 下载失败时自动回退到颜色启发式。
+    segmenter_model_path : str or None
+        显式指定 ``selfie_multiclass_256x256.tflite`` 的本地路径；
+        留空时自动从 ``models/`` 或 ``~/.cache/add_neck_source/`` 加载，
+        若都不存在则联网下载（仅首次）。
     debug_dir : str or None
-        调试输出目录。非空时会在该目录下保存每一步的中间图片（按 00_~14_ 编号）。
+        调试输出目录。非空时会在该目录下保存每一步的中间图片。
     """
 
     def __init__(
@@ -730,6 +858,8 @@ class NeckSourceTransplant:
         skin_h_shift: float = 0.0,
         skin_s_scale: float = 1.0,
         tone_match_strength: float = TRANSPLANT_TONE_MATCH_STRENGTH,
+        use_segmenter: bool = True,
+        segmenter_model_path: Optional[str] = None,
         debug_dir: Optional[str] = None,
     ):
         self.neck_top_inset = float(np.clip(neck_top_inset, 0.70, 1.0))
@@ -742,6 +872,10 @@ class NeckSourceTransplant:
         self.skin_h_shift = skin_h_shift
         self.skin_s_scale = skin_s_scale
         self.tone_match_strength = float(np.clip(tone_match_strength, 0.0, 1.0))
+        self.use_segmenter = bool(use_segmenter)
+        self.segmenter_model_path = (
+            os.path.abspath(segmenter_model_path) if segmenter_model_path else None
+        )
         self.debug_dir: Optional[str] = None
         self._debug_step: int = 0
         if debug_dir:
@@ -984,28 +1118,86 @@ class NeckSourceTransplant:
                                  flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         self._debug_img("source_warped", warped)
 
-        proc_bgr = self._procedural_neck_layer(h, w, poly, mask_bool, skin_bgr)
-        proc_bgra = np.dstack([proc_bgr, mask_u8])
-        self._debug_img("procedural_neck", proc_bgra)
-
         ref_pixels = _gather_face_skin_pixels_bgr(head_bgra, head_landmarks, h, w, patch=22)
         if ref_pixels.shape[0] < 8:
             ref_pixels = np.array([skin_bgr], dtype=np.uint8).reshape(1, 3)
 
-        # 用 source 自己的脸部肤色做"皮肤相似度"参考；source 的肤色更接近 warped 后的脖子色彩，
-        # 避免被 head 与 source 之间的肤色差异误判。
         src_ref_pixels = _gather_face_skin_pixels_bgr(source_bgra, source_landmarks, sH, sW, patch=22)
         if src_ref_pixels.shape[0] < 8:
             src_ref_pixels = ref_pixels
 
-        skin_w_map = self._skin_similarity_map(warped[:, :, :3], src_ref_pixels)
-        if self.debug_dir is not None:
-            self._debug_alpha("skin_similarity", skin_w_map)
+        # ============ 主皮肤检测：MediaPipe Selfie Multiclass Segmenter ============
+        # 直接对 source 做语义分割（face-skin + body-skin = 真皮肤），
+        # 然后用 affine 变换到 head 空间，作为 skin_w_map 的主信号。
+        skin_w_map: Optional[np.ndarray] = None
+        seg_used = False
+        if self.use_segmenter:
+            seg_skin_src = segment_skin_mask(
+                source_bgra, model_path=self.segmenter_model_path,
+            )
+            if seg_skin_src is not None:
+                seg_u8_src = (seg_skin_src.astype(np.uint8) * 255)
+                # 用同一份 affine_M32 把 mask 也 warp 到 head 空间
+                seg_warp = cv2.warpAffine(
+                    seg_u8_src, affine_M32, (w, h),
+                    flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                skin_w_map = (seg_warp.astype(np.float32) / 255.0)
+                # 边缘平滑
+                skin_w_map = cv2.GaussianBlur(skin_w_map, (5, 5), 1.2)
+                seg_used = True
+                if self.debug_dir is not None:
+                    # 保存 source 上的原始分割结果，便于排查
+                    seg_dbg = np.zeros((sH, sW, 4), dtype=np.uint8)
+                    seg_dbg[..., :3] = source_bgra[..., :3]
+                    overlay = source_bgra[..., :3].astype(np.float32)
+                    pink = np.array([200, 100, 255], dtype=np.float32)
+                    overlay[seg_skin_src] = (
+                        overlay[seg_skin_src] * 0.45 + pink * 0.55
+                    )
+                    seg_dbg[..., :3] = np.clip(overlay, 0, 255).astype(np.uint8)
+                    seg_dbg[..., 3] = 255
+                    self._debug_img("segmenter_source", seg_dbg)
 
+        # 若 segmenter 不可用 / 失败，回退到 Lab 距离启发式
+        if skin_w_map is None:
+            skin_w_map = self._skin_similarity_map(
+                warped[:, :, :3], src_ref_pixels,
+            )
+
+        if self.debug_dir is not None:
+            self._debug_alpha(
+                "skin_similarity_seg" if seg_used else "skin_similarity_lab",
+                skin_w_map,
+            )
+
+        # 把 warped 多边形内部的"非皮肤"像素（衣领/头发等）用周围真实皮肤纹理 inpaint 出去，
+        # 让左右两侧都拥有 source 真皮肤的色彩 + 纹理，避免一侧被 procedural 平面色填充而显得"缺一块"。
+        warped_filled = self._inpaint_non_skin(
+            warped[:, :, :3], skin_w_map, mask_bool,
+        )
+        if self.debug_dir is not None:
+            self._debug_img("warped_skin_filled",
+                             np.dstack([warped_filled, mask_u8]))
+
+        # 以 warped 真皮肤中位色作为 procedural 基础色，使无 warped 信息的边缘也协调一致。
+        proc_skin_bgr = skin_bgr
+        sw_in_mask = (skin_w_map > 0.7) & mask_bool
+        if int(sw_in_mask.sum()) >= 60:
+            warp_skin_pixels = warped[sw_in_mask][:, :3]
+            med = np.median(warp_skin_pixels.astype(np.float64), axis=0)
+            proc_skin_bgr = (med * 0.65 + np.asarray(skin_bgr, dtype=np.float64) * 0.35)
+
+        proc_bgr = self._procedural_neck_layer(h, w, poly, mask_bool, proc_skin_bgr)
+        proc_bgra = np.dstack([proc_bgr, mask_u8])
+        self._debug_img("procedural_neck", proc_bgra)
+
+        # 用 inpaint 后的 warped 替代原 warped 进行融合：左右两侧都有"真皮肤"风格的像素。
         neck_bgra = np.zeros((h, w, 4), dtype=np.uint8)
         neck_bgr = proc_bgr.copy()
         neck_bgr = self._blend_transplant(
-            neck_bgr, warped[:, :, :3], mask_bool, skin_w_map,
+            neck_bgr, warped_filled, mask_bool, None,
         )
         neck_blended_bgra = np.dstack([neck_bgr, mask_u8])
         self._debug_img("transplant_blended", neck_blended_bgra)
@@ -1064,6 +1256,28 @@ class NeckSourceTransplant:
         return np.clip(np.round(bgr), 0, 255).astype(np.uint8)
 
     # ---- internal: transplant blend ------------------------------------------
+
+    @staticmethod
+    def _inpaint_non_skin(
+        warped_bgr: np.ndarray, skin_w_map: np.ndarray, mask_bool: np.ndarray,
+        skin_thresh: float = 0.55, dilate_iters: int = 1, radius: int = 5,
+    ) -> np.ndarray:
+        """对 warped 图中位于 mask 内、但被判定为"非皮肤"的像素，用 OpenCV INPAINT
+        从周围真皮肤区域延伸像素填上去，保留真实皮肤的纹理与微变化。"""
+        non_skin = (skin_w_map < skin_thresh) & mask_bool
+        if dilate_iters > 0:
+            kernel = np.ones((3, 3), np.uint8)
+            non_skin = cv2.dilate(
+                non_skin.astype(np.uint8), kernel, iterations=int(dilate_iters)
+            ).astype(bool)
+        if not np.any(non_skin):
+            return warped_bgr.copy()
+        # mask=255 表示需要 inpaint 的位置
+        m = (non_skin.astype(np.uint8)) * 255
+        # 为了避免从多边形外（夹克/背景）取像素，先把多边形外区域也标记为 inpaint 的"已知 = 不是这里"——
+        # 即只允许从多边形内的真皮肤区域取像素。把外部填成"未知"会扩大问题，所以反过来用：把外部区域
+        # 用 mask 内 known 像素先临时填好（用 NS 法 + 较小 radius），再做最终 inpaint 即可获得平滑结果。
+        return cv2.inpaint(warped_bgr, m, int(radius), cv2.INPAINT_TELEA)
 
     @staticmethod
     def _skin_similarity_map(
@@ -1171,10 +1385,18 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--no-pose-correction", dest="pose_correction", action="store_false")
     parser.add_argument("--no-auto-scale", dest="auto_scale_by_jaw", action="store_false")
     parser.add_argument(
+        "--no-segmenter", dest="use_segmenter", action="store_false",
+        help="关闭 MediaPipe Selfie 分割模型，回退到颜色启发式。",
+    )
+    parser.add_argument(
+        "--segmenter-model", default=None,
+        help="可选：本地 selfie_multiclass_256x256.tflite 路径；不填则自动下载到 models/ 缓存。",
+    )
+    parser.add_argument(
         "--debug", default=None,
         help="启用调试输出：将每一步中间图片保存到指定目录",
     )
-    parser.set_defaults(pose_correction=True, auto_scale_by_jaw=True)
+    parser.set_defaults(pose_correction=True, auto_scale_by_jaw=True, use_segmenter=True)
     args = parser.parse_args(argv)
 
     if args.output:
@@ -1197,6 +1419,8 @@ def main(argv: Optional[list] = None) -> int:
         skin_h_shift=args.skin_h_shift,
         skin_s_scale=args.skin_s_scale,
         tone_match_strength=args.tone_match_strength,
+        use_segmenter=args.use_segmenter,
+        segmenter_model_path=args.segmenter_model,
         debug_dir=args.debug,
     )
 
