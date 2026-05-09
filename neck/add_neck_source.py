@@ -78,6 +78,19 @@ JAW_SPAN_DEPTH_MIN_PX = 36.0
 NECK_FEATHER_FRAC = 0.025
 NECK_FEATHER_MIN_PX = 1.5
 NECK_FEATHER_MAX_PX = 16.0
+
+# 把"source 像素覆盖区"判定从原来的 α >= 32 收紧到 α >= WARP_ALPHA_VALID_THRESH。
+# 原 32 太宽松：source 抗锯齿 / 下颌阴影过渡区的中等 α 像素（α=60~220）会被
+# 当作 valid，而这些像素本质上是 skin + 非-skin 内容（衣领色 / 头发暗影）的
+# 混合，颜色偏离正常肤色，呈灰 / 黄褐"杂质"。提高阈值后只保留几乎全不透
+# 的像素，混色被排除（变透明，不填充任何像素，符合"保持透明"约束）。
+WARP_ALPHA_VALID_THRESH = 224
+# warp_gate 软门：α 在 [LOW, HIGH] 区间线性 ramp，低于 LOW 完全归零。原版用
+# α / 64 在 α=64 就饱和到 1.0，无法拦截 60~200 的中等 α 杂质。这个 ramp 与
+# valid_warp 阈值协同 — 后者把混色排除出 binary mask，前者把 feather Gaussian
+# 漏到这些位置的"丝丝杂质"也压回 0。
+WARP_GATE_LOW = 200.0
+WARP_GATE_HIGH = 240.0
 NECK_SUPPRESS_DECAY_FRAC = 0.06
 NECK_SUPPRESS_DECAY_MIN_PX = 4.0
 # 抑制曲线：仅当 head_alpha ≥ NECK_SUPPRESS_OPAQUE_THRESH 时才参与抑制；
@@ -1303,7 +1316,7 @@ class NeckSourceTransplant:
         # 空间覆盖了 source 实际"没像素"的区域。这里直接用 warped α 把那些
         # 虚假区域剪掉：source 没像素的地方保持透明，绝不凭空合成皮肤。
         warp_alpha_u8 = warped[:, :, 3]
-        valid_warp_u8 = (warp_alpha_u8 >= 32).astype(np.uint8) * 255
+        valid_warp_u8 = (warp_alpha_u8 >= WARP_ALPHA_VALID_THRESH).astype(np.uint8) * 255
         # 形态学开操作消除抗锯齿边沿一两像素的孤点；再小幅闭操作把 mask 内
         # 偶发的 1-2 像素孔洞补上（source 抠图里少量内部空洞），保证脖子内部
         # 不会因此出现孤立透明斑点。
@@ -1382,11 +1395,14 @@ class NeckSourceTransplant:
 
         # ============ 用 source α 软门裁掉羽化超出 source 实际像素的 fringe ============
         # _feather_alpha 的 Gaussian 会把 mask 边沿向四周扩散 ~5-7 像素，扩到
-        # source 实际"没像素"的位置时就形成可见的丝状杂质。这里用 warped α 做
-        # 软门：source α=0 处 → 0；source α≥soft_thresh 处 → 1；中间线性过渡，
-        # 保持 source 抗锯齿边沿的 1-2 像素自然柔和过渡，但不让 fringe 越过
-        # source 真实轮廓。
-        warp_alpha_soft = (warped[:, :, 3].astype(np.float64) / 64.0)
+        # source 抗锯齿过渡区（α ∈ [LOW, HIGH]）就形成可见的灰 / 黄褐"丝状杂质"
+        # —— 那些位置的 BGR 是 skin + 衣领 / 阴影的混色。这里用 warped α 做
+        # 严格软门：α<LOW 完全归零；α 在 [LOW, HIGH] 线性 ramp；α>=HIGH 才完全
+        # 显示。配合 valid_warp_u8 用同一档阈值，能把 source 边缘混色彻底变
+        # 透明，仍不填充任何像素（保持"source 没干净像素就透明"的语义）。
+        warp_alpha_soft = (warped[:, :, 3].astype(np.float64) - WARP_GATE_LOW) / max(
+            WARP_GATE_HIGH - WARP_GATE_LOW, 1.0,
+        )
         warp_alpha_soft = np.clip(warp_alpha_soft, 0.0, 1.0)
         refined_alpha = refined_alpha * warp_alpha_soft
         self._debug_alpha("alpha_warpgate", refined_alpha)
