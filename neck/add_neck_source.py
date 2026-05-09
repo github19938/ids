@@ -1272,6 +1272,17 @@ class NeckSourceTransplant:
         refined_alpha = self._fade_out_alpha(refined_alpha, poly, h)
         self._debug_alpha("alpha_fadeout", refined_alpha)
 
+        # ============ 用 source α 软门裁掉羽化超出 source 实际像素的 fringe ============
+        # _feather_alpha 的 Gaussian 会把 mask 边沿向四周扩散 ~5-7 像素，扩到
+        # source 实际"没像素"的位置时就形成可见的丝状杂质。这里用 warped α 做
+        # 软门：source α=0 处 → 0；source α≥soft_thresh 处 → 1；中间线性过渡，
+        # 保持 source 抗锯齿边沿的 1-2 像素自然柔和过渡，但不让 fringe 越过
+        # source 真实轮廓。
+        warp_alpha_soft = (warped[:, :, 3].astype(np.float64) / 64.0)
+        warp_alpha_soft = np.clip(warp_alpha_soft, 0.0, 1.0)
+        refined_alpha = refined_alpha * warp_alpha_soft
+        self._debug_alpha("alpha_warpgate", refined_alpha)
+
         neck_bgra[:, :, 3] = np.clip(np.round(refined_alpha * 255.0), 0, 255).astype(np.uint8)
         self._debug_img("neck_final_layer", neck_bgra)
 
