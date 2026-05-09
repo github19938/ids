@@ -1209,14 +1209,23 @@ class NeckSourceTransplant:
                 mask_u8 = seg_neck_mask_h
                 mask_bool = mask_u8 >= 1
 
-        # 把 warped 多边形内部的"非皮肤"像素（衣领/头发等）用周围真实皮肤纹理 inpaint 出去，
-        # 让左右两侧都拥有 source 真皮肤的色彩 + 纹理，避免一侧被 procedural 平面色填充而显得"缺一块"。
-        warped_filled = self._inpaint_non_skin(
-            warped[:, :, :3], skin_w_map, mask_bool,
-        )
+        # ============ Mask 收紧到 source 实际像素覆盖区 ============
+        # MediaPipe 分割是基于 RGB 判定的，对 source 里 α=0 但 RGB 仍是肤色的
+        # 位置（抠图边缘 / 背景肤色噪点）也会判为 skin，导致 seg mask 在 head
+        # 空间覆盖了 source 实际"没像素"的区域。这里直接用 warped α 把那些
+        # 虚假区域剪掉：source 没像素的地方保持透明，绝不凭空合成皮肤。
+        warp_alpha_u8 = warped[:, :, 3]
+        valid_warp_u8 = (warp_alpha_u8 >= 32).astype(np.uint8) * 255
+        # 形态学开操作消除抗锯齿边沿一两像素的孤点；再小幅闭操作把 mask 内
+        # 偶发的 1-2 像素孔洞补上（source 抠图里少量内部空洞），保证脖子内部
+        # 不会因此出现孤立透明斑点。
+        kernel3 = np.ones((3, 3), np.uint8)
+        valid_warp_u8 = cv2.morphologyEx(valid_warp_u8, cv2.MORPH_OPEN, kernel3, iterations=1)
+        valid_warp_u8 = cv2.morphologyEx(valid_warp_u8, cv2.MORPH_CLOSE, kernel3, iterations=1)
+        mask_u8 = np.where(valid_warp_u8 > 0, mask_u8, np.uint8(0))
+        mask_bool = mask_u8 >= 1
         if self.debug_dir is not None:
-            self._debug_img("warped_skin_filled",
-                             np.dstack([warped_filled, mask_u8]))
+            self._debug_img("neck_mask_warpalpha", mask_u8)
 
         # 以 warped 真皮肤中位色作为 procedural 基础色，使无 warped 信息的边缘也协调一致。
         proc_skin_bgr = skin_bgr
@@ -1226,11 +1235,21 @@ class NeckSourceTransplant:
             med = np.median(warp_skin_pixels.astype(np.float64), axis=0)
             proc_skin_bgr = (med * 0.65 + np.asarray(skin_bgr, dtype=np.float64) * 0.35)
 
+        # 把 warped 多边形内部的"非皮肤"像素（衣领/头发等）用周围真实皮肤纹理 inpaint 出去，
+        # 让左右两侧都拥有 source 真皮肤的色彩 + 纹理，避免一侧被 procedural 平面色填充而显得"缺一块"。
+        # 注：mask 已被 warped α 收紧，inpaint 只在 source 实际有像素的区域里运行。
+        warped_filled = self._inpaint_non_skin(
+            warped[:, :, :3], skin_w_map, mask_bool,
+        )
+        if self.debug_dir is not None:
+            self._debug_img("warped_skin_filled",
+                             np.dstack([warped_filled, mask_u8]))
+
         proc_bgr = self._procedural_neck_layer(h, w, poly, mask_bool, proc_skin_bgr)
         proc_bgra = np.dstack([proc_bgr, mask_u8])
         self._debug_img("procedural_neck", proc_bgra)
 
-        # 用 inpaint 后的 warped 替代原 warped 进行融合：左右两侧都有"真皮肤"风格的像素。
+        # 用 inpaint 后的 warped 替代原 warped 进行融合：mask 内必然有 source 像素。
         neck_bgra = np.zeros((h, w, 4), dtype=np.uint8)
         neck_bgr = proc_bgr.copy()
         neck_bgr = self._blend_transplant(
@@ -1426,11 +1445,7 @@ class NeckSourceTransplant:
             ).astype(bool)
         if not np.any(non_skin):
             return warped_bgr.copy()
-        # mask=255 表示需要 inpaint 的位置
         m = (non_skin.astype(np.uint8)) * 255
-        # 为了避免从多边形外（夹克/背景）取像素，先把多边形外区域也标记为 inpaint 的"已知 = 不是这里"——
-        # 即只允许从多边形内的真皮肤区域取像素。把外部填成"未知"会扩大问题，所以反过来用：把外部区域
-        # 用 mask 内 known 像素先临时填好（用 NS 法 + 较小 radius），再做最终 inpaint 即可获得平滑结果。
         return cv2.inpaint(warped_bgr, m, int(radius), cv2.INPAINT_TELEA)
 
     @staticmethod
