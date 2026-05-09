@@ -614,6 +614,58 @@ def _affine_pts(pts: np.ndarray, M: np.ndarray) -> np.ndarray:
     return (M @ pts_h.T).T
 
 
+def _stretch_below_y(arr: np.ndarray, pivot_y: float, scale: float) -> np.ndarray:
+    """对图像 / mask 在垂直方向上进行"分段缩放"：``y < pivot_y`` 保持原样；
+    ``y >= pivot_y`` 按 ``scale`` 倍向下拉长（输出 y 处采样自
+    ``pivot_y + (y - pivot_y) / scale``）。
+
+    用 ``cv2.remap`` 双线性插值；支持 1 通道 (uint8 mask) 和 4 通道 BGRA。
+    """
+    if scale is None or scale <= 1.0001 and scale >= 0.9999:
+        return arr.copy()
+    H = int(arr.shape[0])
+    W = int(arr.shape[1])
+    pivot_y = float(pivot_y)
+    s = float(scale)
+
+    yy = np.arange(H, dtype=np.float32)[:, None]
+    src_y_col = np.where(
+        yy >= pivot_y, pivot_y + (yy - pivot_y) / s, yy,
+    ).astype(np.float32)
+    map_y = np.broadcast_to(src_y_col, (H, W)).astype(np.float32)
+    map_x = np.broadcast_to(
+        np.arange(W, dtype=np.float32)[None, :], (H, W),
+    ).astype(np.float32)
+
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        bv = (0, 0, 0, 0)
+    elif arr.ndim == 3:
+        bv = (0,) * arr.shape[2]
+    else:
+        bv = 0
+    return cv2.remap(
+        arr, map_x, map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=bv,
+    )
+
+
+def _stretch_poly_below_y(poly: np.ndarray, pivot_y: float, scale: float) -> np.ndarray:
+    """对多边形坐标做与 :func:`_stretch_below_y` 一致的垂直拉长：
+    ``y > pivot_y`` 的顶点 y 值变为 ``pivot_y + (y - pivot_y) * scale``。"""
+    if scale is None or (0.9999 <= scale <= 1.0001):
+        return poly.copy()
+    pivot_y = float(pivot_y)
+    s = float(scale)
+    new_y = np.where(
+        poly[:, 1] > pivot_y,
+        pivot_y + (poly[:, 1] - pivot_y) * s,
+        poly[:, 1],
+    )
+    return np.column_stack([poly[:, 0], new_y]).astype(poly.dtype)
+
+
 CLOTHING_DETECT_TOP_SKIP_FRAC = 0.12
 CLOTHING_DETECT_LAB_THRESHOLD = 70.0
 CLOTHING_DETECT_CONSECUTIVE_ROWS = 3
@@ -826,6 +878,12 @@ class NeckSourceTransplant:
         底边外扩系数（>=1.02）。默认 1.05。
     neck_depth_frac : float
         脖子深度系数（越大脖子越长）。默认 1.4。
+    neck_length_scale : float
+        脖子向下拉长倍数（在 head 空间里，对下颌以下的 warped 像素 + mask 做垂直拉伸）。
+        1.0 = 不拉长（默认）；1.5 = 拉长 1.5 倍；2.0 = 拉长 2 倍。脸部完全不变。
+        与 ``neck_depth_frac`` 不同：``neck_depth_frac`` 只调几何参考多边形的深度，
+        而最终脖子像素来自 source 的真实皮肤覆盖，所以单调它对实际长度无效；
+        ``neck_length_scale`` 才是真正把 source 中已有的脖子像素拉长。
     pose_correction : bool
         是否启用姿态修正（俯仰/yaw 影响 overlap）。默认 True。
     auto_scale_by_jaw : bool
@@ -860,6 +918,7 @@ class NeckSourceTransplant:
         neck_slim_scale: float = NECK_SLIM_SCALE_DEFAULT,
         neck_bottom_flare: float = 1.05,
         neck_depth_frac: float = 1.4,
+        neck_length_scale: float = 1.0,
         pose_correction: bool = True,
         auto_scale_by_jaw: bool = True,
         skin_v_scale: float = 0.92,
@@ -875,6 +934,7 @@ class NeckSourceTransplant:
         self.neck_slim_scale = float(np.clip(neck_slim_scale, 0.72, 1.0))
         self.neck_bottom_flare = max(1.02, float(neck_bottom_flare))
         self.neck_depth_frac = float(neck_depth_frac)
+        self.neck_length_scale = float(np.clip(neck_length_scale, 0.5, 4.0))
         self.pose_correction = pose_correction
         self.auto_scale_by_jaw = auto_scale_by_jaw
         self.skin_v_scale = skin_v_scale
@@ -1128,6 +1188,15 @@ class NeckSourceTransplant:
                                  flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         self._debug_img("source_warped", warped)
 
+        # ============ 计算 head 空间的"下颌枢轴 Y" ============
+        # 这个 Y 用作"脖子拉长"的分界线：≥ pivot 的部分会被垂直拉长，
+        # < pivot 的部分（脸）保持不变。取 source 下颌点经 affine 投影到 head
+        # 空间的 y 值，即 head 中下颌 landmark 对应的 y。
+        chin_h_pt = _affine_pts(
+            np.array([[chin_s_x, chin_s_y]], dtype=np.float64), affine_M32,
+        )
+        chin_h_y = float(chin_h_pt[0, 1])
+
         ref_pixels = _gather_face_skin_pixels_bgr(head_bgra, head_landmarks, h, w, patch=22)
         if ref_pixels.shape[0] < 8:
             ref_pixels = np.array([skin_bgr], dtype=np.uint8).reshape(1, 3)
@@ -1209,6 +1278,25 @@ class NeckSourceTransplant:
                 mask_u8 = seg_neck_mask_h
                 mask_bool = mask_u8 >= 1
 
+        # ============ 脖子向下拉长（neck_length_scale） ============
+        # 在 head 空间中以 chin_h_y 为枢轴，对其下方做垂直拉伸：脸（pivot 上）
+        # 不变，脖子区域（pivot 下）按倍数拉长。warped 图像 + seg mask + poly
+        # 同步拉长，保证下游所有处理（轮廓 / 光照 / 衰减）一致；warped α 也
+        # 跟着拉长，所以"source 没像素 → 透明"的约束依然成立。
+        if abs(self.neck_length_scale - 1.0) > 1e-3:
+            warped = _stretch_below_y(warped, chin_h_y, self.neck_length_scale)
+            if self.debug_dir is not None:
+                self._debug_img("source_warped_stretched", warped)
+            mask_u8 = _stretch_below_y(mask_u8, chin_h_y, self.neck_length_scale)
+            mask_bool = mask_u8 >= 1
+            poly = _stretch_poly_below_y(poly, chin_h_y, self.neck_length_scale)
+            poly[:, 1] = np.clip(poly[:, 1], 0.0, float(h - 1))
+            # skin_w_map（segmenter 提供的"皮肤可信度"）也应跟着拉长，
+            # 这样 inpaint 在拉长后的脖子区里仍能正确识别非皮肤像素。
+            skin_w_map = _stretch_below_y(
+                skin_w_map.astype(np.float32), chin_h_y, self.neck_length_scale,
+            )
+
         # ============ Mask 收紧到 source 实际像素覆盖区 ============
         # MediaPipe 分割是基于 RGB 判定的，对 source 里 α=0 但 RGB 仍是肤色的
         # 位置（抠图边缘 / 背景肤色噪点）也会判为 skin，导致 seg mask 在 head
@@ -1226,6 +1314,26 @@ class NeckSourceTransplant:
         mask_bool = mask_u8 >= 1
         if self.debug_dir is not None:
             self._debug_img("neck_mask_warpalpha", mask_u8)
+
+        # ============ 拉长后两侧"顺 + 直"矫正 ============
+        # 1.0 默认不开；scale > 1.05 时才修整 — 因为只有拉长才会把 source 自身
+        # 的颈到肩解剖学过渡放大成可见鼓包。sigma_y / max_taper 都按 scale 自适应：
+        # scale 越大，需要平滑的范围越大、"直"的 envelope 也略收紧。
+        if self.neck_length_scale > 1.05:
+            stretched_excess = float(self.neck_length_scale - 1.0)
+            sigma_y = float(np.clip(
+                head_jaw_span * 0.04 * (1.0 + stretched_excess), 4.0, 24.0,
+            ))
+            max_taper = float(np.clip(1.0 - 0.03 * stretched_excess, 0.94, 1.0))
+            mask_u8 = self._smooth_neck_sides(
+                mask_u8, pivot_y=chin_h_y,
+                sigma_y=sigma_y, max_taper=max_taper,
+            )
+            # 再与 valid_warp 取交集，确保不向 source 不存在的位置外扩
+            mask_u8 = np.where(valid_warp_u8 > 0, mask_u8, np.uint8(0))
+            mask_bool = mask_u8 >= 1
+            if self.debug_dir is not None:
+                self._debug_img("neck_mask_sides_smoothed", mask_u8)
 
         # 以 warped 真皮肤中位色作为 procedural 基础色，使无 warped 信息的边缘也协调一致。
         proc_skin_bgr = skin_bgr
@@ -1321,6 +1429,100 @@ class NeckSourceTransplant:
         skin = np.array(skin_bgr, dtype=np.float64)
         bgr = np.tile(skin[None, None, :], (h, w, 1)) * L[:, :, np.newaxis]
         return np.clip(np.round(bgr), 0, 255).astype(np.uint8)
+
+    # ---- internal: 脖子两侧"顺 + 直"矫正 -----------------------------------
+
+    @staticmethod
+    def _smooth_neck_sides(
+        mask_u8: np.ndarray,
+        pivot_y: float,
+        sigma_y: float,
+        max_taper: float = 0.98,
+        chin_anchor_rows: int = 9,
+    ) -> np.ndarray:
+        """对二值脖子掩码做"顺 + 直"两步矫正（仅作用于 ``pivot_y`` 以下）：
+
+        1. **顺**（沿 y 平滑边界）：逐行采集 mask 的 left/right 边界曲线，
+           沿 y 做 1D Gaussian 平滑（``sigma_y``），抹平跨行的横向突起 —
+           神经性短促鼓包不会再被拉长放大。
+        2. **直**（限制半宽不超下颌）：取下颌处（pivot 下若干行）的 half-width
+           中位数作为参考，并用 smoothstep envelope 把 pivot_y 以下的 half-width
+           上限从 ``chin_half_w`` 平滑过渡到 ``chin_half_w * max_taper``。这
+           保证脖子在 chin 以下不会向外鼓出，呈近圆柱（略向下收）的"直"轮廓。
+
+        仅缩窄，不外扩；对原本就比上限窄的 row 不做修改。整个矫正只重排
+        左右边界，对内部不打洞。
+        """
+        if mask_u8 is None or mask_u8.size == 0:
+            return mask_u8
+        h, w = mask_u8.shape[:2]
+        bin_mask = (mask_u8 > 127)
+        row_any = bin_mask.any(axis=1)
+        if not row_any.any():
+            return mask_u8
+
+        ys_idx = np.where(row_any)[0]
+        y0, y1 = int(ys_idx[0]), int(ys_idx[-1])
+        pivot_y_i = int(round(pivot_y))
+        smooth_y0 = max(pivot_y_i, y0)
+        if smooth_y0 >= y1 - 2:
+            return mask_u8
+
+        left = np.full(h, -1, dtype=np.int32)
+        right = np.full(h, -1, dtype=np.int32)
+        for y in range(y0, y1 + 1):
+            cols = np.where(bin_mask[y])[0]
+            if len(cols):
+                left[y] = int(cols[0])
+                right[y] = int(cols[-1])
+
+        rows = np.arange(smooth_y0, y1 + 1)
+        L_raw = left[rows].astype(np.float32)
+        R_raw = right[rows].astype(np.float32)
+        valid = (L_raw >= 0) & (R_raw >= 0)
+        if int(valid.sum()) < 5:
+            return mask_u8
+        if not valid.all():
+            idx = np.arange(len(rows), dtype=np.float32)
+            L_raw = np.interp(idx, idx[valid], L_raw[valid]).astype(np.float32)
+            R_raw = np.interp(idx, idx[valid], R_raw[valid]).astype(np.float32)
+
+        sigma_y = max(float(sigma_y), 1.0)
+        k = max(int(round(sigma_y * 4)) | 1, 5)
+        L_smooth = cv2.GaussianBlur(
+            L_raw.reshape(-1, 1), (1, k), sigma_y,
+        ).flatten()
+        R_smooth = cv2.GaussianBlur(
+            R_raw.reshape(-1, 1), (1, k), sigma_y,
+        ).flatten()
+
+        cx = 0.5 * (L_smooth + R_smooth)
+        half_w = 0.5 * (R_smooth - L_smooth)
+
+        n_top = int(np.clip(chin_anchor_rows, 3, max(3, len(rows) // 4)))
+        chin_half_w = float(np.median(half_w[:n_top]))
+
+        if max_taper < 0.999 and len(rows) > 1:
+            t = np.linspace(0.0, 1.0, len(rows), dtype=np.float32)
+            ease = t * t * (3.0 - 2.0 * t)
+            env = 1.0 - (1.0 - float(max_taper)) * ease
+            cap_half_w = chin_half_w * env
+        else:
+            cap_half_w = np.full(len(rows), chin_half_w, dtype=np.float32)
+
+        # 仅缩窄：min(原 half_w, cap)
+        half_w = np.minimum(half_w, cap_half_w)
+        L_final = cx - half_w
+        R_final = cx + half_w
+
+        new_mask = mask_u8.copy()
+        new_mask[smooth_y0:y1 + 1] = 0
+        for i, y in enumerate(rows):
+            l = max(int(round(L_final[i])), 0)
+            r = min(int(round(R_final[i])), w - 1)
+            if l <= r:
+                new_mask[y, l:r + 1] = 255
+        return new_mask
 
     # ---- internal: segmenter-derived mask --------------------------------------
 
@@ -1564,6 +1766,10 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--neck-slim", type=float, default=NECK_SLIM_SCALE_DEFAULT)
     parser.add_argument("--neck-bottom-flare", type=float, default=1.05)
     parser.add_argument("--neck-depth-frac", type=float, default=1.4)
+    parser.add_argument(
+        "--neck-length", type=float, default=1.0,
+        help="脖子向下拉长倍数（>1 拉长，1.0 不变）。例：1.5 / 2.0；脸部不变。",
+    )
     parser.add_argument("--skin-v-scale", type=float, default=0.92)
     parser.add_argument("--skin-h-shift", type=float, default=0.0)
     parser.add_argument("--skin-s-scale", type=float, default=1.0)
@@ -1606,6 +1812,7 @@ def main(argv: Optional[list] = None) -> int:
         neck_slim_scale=args.neck_slim,
         neck_bottom_flare=args.neck_bottom_flare,
         neck_depth_frac=args.neck_depth_frac,
+        neck_length_scale=args.neck_length,
         pose_correction=args.pose_correction,
         auto_scale_by_jaw=args.auto_scale_by_jaw,
         skin_v_scale=args.skin_v_scale,
