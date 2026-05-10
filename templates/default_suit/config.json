@@ -1,0 +1,32 @@
+{
+  "name": "default_suit",
+  "description": "Navy V-neck knit sweater vest with white collared shirt and plaid bow tie (21.png). The collar, shirt and bow tie are baked into the body image, so no separate collar layer is used.",
+  "body_image": "21.png",
+  "collar_image": null,
+  "anchor_points": {
+    "left_shoulder": [
+      81,
+      43
+    ],
+    "right_shoulder": [
+      217,
+      43
+    ],
+    "neck": [
+      149,
+      32
+    ]
+  },
+  "color_match": {
+    "enable": true,
+    "strength": 0.25,
+    "match_chroma": false
+  },
+  "render": {
+    "feather_px": 4,
+    "protect_dilate_px": 2,
+    "scale_bias": 1.08,
+    "y_offset_ratio": 0.0,
+    "final_sharpen": 0.15
+  }
+}

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.idea/
+.vscode/
+examples/synthetic_*.png
