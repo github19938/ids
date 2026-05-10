@@ -92,6 +92,7 @@ class MakeIDPhoto:
         clothes_vneck_dilate_px: Optional[int] = None,
         stretch_mode: Optional[str] = None,
         neck_target_length: Optional[float] = None,
+        save_debug_steps: bool = True,
     ):
         """
         :param head_path: 抠图头像路径（RGBA PNG，背景透明）
@@ -107,6 +108,7 @@ class MakeIDPhoto:
             可能反而暴露漏白。负值 = 上移，让衣领遮更多脖子下端漏白。
         :param clothes_vneck_dilate_px: 衣服 alpha 向上 dilate 像素（默认 0）。>0 让衣领
             布料"向上扩展"盖更多脖子下端，是变形而非平移——最针对漏白的参数。
+        :param save_debug_steps: 默认 True，在 ``-o`` 同目录保存各步调试图（``{主名}_debug_*.png``）
         """
         self.head_path = head_path
         self.source_path = source_path
@@ -142,6 +144,14 @@ class MakeIDPhoto:
             float(np.clip(neck_target_length, 0.50, 4.0))
             if neck_target_length is not None else self.NECK_TARGET_LENGTH_FRAC
         )
+        self.save_debug_steps = save_debug_steps
+        self._debug_path_prefix: Optional[str] = None
+
+    def _debug_save(self, label: str, image: np.ndarray) -> None:
+        if self._debug_path_prefix is None:
+            return
+        path = f"{self._debug_path_prefix}{label}.png"
+        self._imwrite(path, image)
 
     # =================================================================================
     # 主流程
@@ -149,10 +159,20 @@ class MakeIDPhoto:
 
     def run(self) -> int:
         """执行完整 pipeline，返回 0 成功，非零失败。"""
+        out_dir = os.path.dirname(os.path.abspath(self.output_path)) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(self.output_path))[0]
+        self._debug_path_prefix = (
+            os.path.join(out_dir, f"{stem}_debug_") if self.save_debug_steps else None
+        )
+
         # 1. 加载所有图（自动转 RGBA）
         head = self._load_rgba(self.head_path)
         source = self._load_rgba(self.source_path)
         clothes = self._load_rgba(self.clothes_path)
+        self._debug_save("01_head_loaded", head)
+        self._debug_save("02_source_loaded", source)
+        self._debug_save("03_clothes_loaded", clothes)
 
         # 2. 检测原图人脸（用于 transplant 几何对齐）
         source_face = self._detect_face_landmarks(source)
@@ -164,18 +184,23 @@ class MakeIDPhoto:
         head_face = self._detect_face_landmarks(head_padded)
         if head_face is None:
             raise RuntimeError(f"头像未检测到人脸: {self.head_path}")
+        self._debug_save("04_head_padded", head_padded)
 
         # 4. 给头像加脖子：原图 affine warp + 多边形 mask 替换
         head_with_neck = self._add_neck(head_padded, head_face, source, source_face)
+        self._debug_save("05_head_with_neck", head_with_neck)
 
         # 5. 合成证件照（蓝底 + 头像 + 衣服，衣服最上层）
         canvas = self._compose(head_with_neck, clothes)
 
         # 6. 输出
-        out_dir = os.path.dirname(os.path.abspath(self.output_path)) or "."
-        os.makedirs(out_dir, exist_ok=True)
         self._imwrite(self.output_path, canvas)
         print(f"已保存: {self.output_path}  (canvas {canvas.shape[1]}x{canvas.shape[0]})")
+        if self.save_debug_steps:
+            print(
+                f"  调试图: {self._debug_path_prefix}01_….png … 05_….png；"
+                f"合成阶段 06_….png … 11_….png（同目录）"
+            )
         return 0
 
     # =================================================================================
@@ -485,6 +510,8 @@ class MakeIDPhoto:
           衣服 V 领开口 alpha=0 → 露出头像（脸/脖子）
           衣服布料区 alpha>0 → 遮住超出 V 领的脖子
         """
+        self._debug_save("06_compose_clothes_input", clothes)
+
         # 重新检测脖子图上的人脸
         face = self._detect_face_landmarks(head_with_neck)
         if face is None:
@@ -521,6 +548,8 @@ class MakeIDPhoto:
                 clothes[:, :, 3], kernel_v, anchor=(0, 2 * k), iterations=1
             )
 
+        self._debug_save("07_compose_clothes_after_scale_dilate", clothes)
+
         # 衣服 V 领锚点（缩放后重检测）
         cl_h, cl_w = clothes.shape[:2]
         vn_x, vn_y = self._find_clothes_vneck_anchor(clothes)
@@ -535,6 +564,7 @@ class MakeIDPhoto:
         scaled_h = max(1, int(round(h * scale)))
         flag = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
         scaled_head = cv2.resize(head_with_neck, (scaled_w, scaled_h), interpolation=flag)
+        self._debug_save("08_compose_scaled_portrait", scaled_head)
 
         scaled_chin_x = int(round(chin_x * scale))
         scaled_chin_y = int(round(chin_y * scale))
@@ -567,10 +597,13 @@ class MakeIDPhoto:
         canvas[:, :, 1] = bg_g
         canvas[:, :, 2] = bg_r
         canvas[:, :, 3] = 255
+        self._debug_save("09_compose_canvas_bg_only", canvas)
 
         # ★ 合成顺序：底色 ← 头像 ← 衣服（衣服在最上层覆盖脖子）
         canvas = self._alpha_paste(canvas, scaled_head, head_paste_x, head_paste_y)
+        self._debug_save("10_compose_after_portrait_paste", canvas)
         canvas = self._alpha_paste(canvas, clothes, clothes_paste_x, clothes_paste_y)
+        self._debug_save("11_compose_after_clothes_paste", canvas)
         return canvas
 
     # =================================================================================
@@ -795,6 +828,11 @@ def main(argv: Optional[list] = None) -> int:
         help=f"拉伸后脖子总长度 / source_jaw_span，默认 {MakeIDPhoto.NECK_TARGET_LENGTH_FRAC}。"
         "调大让脖子更长；建议 ≥ NECK_DEPTH_FRAC（{}）",
     )
+    parser.add_argument(
+        "--no-save-steps",
+        action="store_true",
+        help="不保存各步调试图（默认会保存到 -o 同目录）",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -810,6 +848,7 @@ def main(argv: Optional[list] = None) -> int:
             clothes_vneck_dilate_px=args.clothes_vneck_dilate,
             stretch_mode=args.stretch_mode,
             neck_target_length=args.neck_target_length,
+            save_debug_steps=not args.no_save_steps,
         )
         return job.run()
     except Exception as e:
